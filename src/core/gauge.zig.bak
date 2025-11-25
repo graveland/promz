@@ -1,0 +1,235 @@
+const std = @import("std");
+const MetricInfo = @import("metric.zig").MetricInfo;
+const MetricError = @import("metric.zig").MetricError;
+const MetricType = @import("metric.zig").MetricType;
+const Sample = @import("sample.zig").Sample;
+const AtomicSample = @import("atomic_sample.zig").AtomicSample;
+const LockedSample = @import("locked_sample.zig").LockedSample;
+const NoLabels = @import("labels.zig").NoLabels;
+const generateLabelKey = @import("labels.zig").generateLabelKey;
+
+/// Configuration for Gauge behavior
+pub const GaugeConfig = struct {
+    /// Enable thread safety (will be used in Phase 5)
+    thread_safe: bool = false,
+    /// Initial capacity for label combinations
+    initial_capacity: usize = 16,
+};
+
+/// Gauge - a metric that can go up or down
+/// Unlike counters, gauges can be incremented, decremented, or set to arbitrary values
+/// Generic over label type TLabels for compile-time type safety
+pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
+    _ = config; // Config will be used in Phase 5 for thread safety
+
+    // Optimization: NoLabels uses a single sample instead of HashMap
+    const use_single_sample = (TLabels == NoLabels);
+
+    return struct {
+        const Self = @This();
+        const SampleMap = std.StringHashMap(Sample);
+        pub const Labels = TLabels;
+
+        allocator: std.mem.Allocator,
+        info: MetricInfo,
+        // For NoLabels: use single sample (zero overhead)
+        // For labels: use HashMap
+        sample: if (use_single_sample) Sample else void,
+        samples: if (use_single_sample) void else SampleMap,
+
+        /// Initialize a gauge with the given name and help text
+        pub fn init(
+            allocator: std.mem.Allocator,
+            name: []const u8,
+            help: []const u8,
+        ) !Self {
+            const info = MetricInfo{
+                .name = name,
+                .help = help,
+                .metric_type = .gauge,
+            };
+            try info.validate();
+
+            if (use_single_sample) {
+                return Self{
+                    .allocator = allocator,
+                    .info = info,
+                    .sample = Sample.init(0.0),
+                    .samples = {},
+                };
+            } else {
+                return Self{
+                    .allocator = allocator,
+                    .info = info,
+                    .sample = {},
+                    .samples = SampleMap.init(allocator),
+                };
+            }
+        }
+
+        /// Clean up resources
+        pub fn deinit(self: *Self) void {
+            if (!use_single_sample) {
+                var it = self.samples.iterator();
+                while (it.next()) |entry| {
+                    self.allocator.free(entry.key_ptr.*);
+                }
+                self.samples.deinit();
+            }
+        }
+
+        /// Increment gauge by 1
+        pub fn inc(self: *Self, labels: TLabels) !void {
+            return self.add(labels, 1.0);
+        }
+
+        /// Decrement gauge by 1
+        pub fn dec(self: *Self, labels: TLabels) !void {
+            return self.sub(labels, 1.0);
+        }
+
+        /// Add a value to the gauge (can be positive or negative)
+        pub fn add(self: *Self, labels: TLabels, value: f64) !void {
+            if (use_single_sample) {
+                self.sample.add(value);
+            } else {
+                const sample = try self.getOrCreateSample(labels);
+                sample.add(value);
+            }
+        }
+
+        /// Subtract a value from the gauge
+        pub fn sub(self: *Self, labels: TLabels, value: f64) !void {
+            if (use_single_sample) {
+                self.sample.sub(value);
+            } else {
+                const sample = try self.getOrCreateSample(labels);
+                sample.sub(value);
+            }
+        }
+
+        /// Set the gauge to an absolute value
+        pub fn set(self: *Self, labels: TLabels, value: f64) !void {
+            if (use_single_sample) {
+                self.sample.set(value);
+            } else {
+                const sample = try self.getOrCreateSample(labels);
+                sample.set(value);
+            }
+        }
+
+        /// Get the current gauge value
+        pub fn get(self: *const Self, labels: TLabels) !f64 {
+            if (use_single_sample) {
+                return self.sample.get();
+            } else {
+                const key = try generateLabelKey(self.allocator, TLabels, labels);
+                defer self.allocator.free(key);
+
+                const sample = self.samples.get(key) orelse return MetricError.SampleNotFound;
+                return sample.get();
+            }
+        }
+
+        /// Get or create a sample for the given labels (internal)
+        fn getOrCreateSample(self: *Self, labels: TLabels) !*Sample {
+            const key = try generateLabelKey(self.allocator, TLabels, labels);
+            errdefer self.allocator.free(key);
+
+            const gop = try self.samples.getOrPut(key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = Sample.init(0.0);
+            } else {
+                // Key already exists, free the duplicate
+                self.allocator.free(key);
+            }
+
+            return gop.value_ptr;
+        }
+    };
+}
+
+test "Gauge(NoLabels): init" {
+    var gauge = try Gauge(NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_gauge",
+        "A test gauge",
+    );
+    defer gauge.deinit();
+
+    try std.testing.expectEqual(0.0, try gauge.get(.{}));
+}
+
+test "Gauge(NoLabels): inc and dec" {
+    var gauge = try Gauge(NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_gauge",
+        "Test",
+    );
+    defer gauge.deinit();
+
+    try gauge.inc(.{});
+    try std.testing.expectEqual(1.0, try gauge.get(.{}));
+
+    try gauge.dec(.{});
+    try std.testing.expectEqual(0.0, try gauge.get(.{}));
+}
+
+test "Gauge(NoLabels): set" {
+    var gauge = try Gauge(NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_gauge",
+        "Test",
+    );
+    defer gauge.deinit();
+
+    try gauge.set(.{}, 42.0);
+    try std.testing.expectEqual(42.0, try gauge.get(.{}));
+}
+
+test "Gauge with struct labels" {
+    const Labels = struct {
+        host: []const u8,
+        region: []const u8,
+    };
+
+    var gauge = try Gauge(Labels, .{}).init(
+        std.testing.allocator,
+        "memory_usage_bytes",
+        "Memory usage in bytes",
+    );
+    defer gauge.deinit();
+
+    try gauge.set(.{ .host = "server1", .region = "us-east" }, 1024.0);
+    try gauge.set(.{ .host = "server2", .region = "us-west" }, 2048.0);
+
+    try std.testing.expectEqual(1024.0, try gauge.get(.{ .host = "server1", .region = "us-east" }));
+    try std.testing.expectEqual(2048.0, try gauge.get(.{ .host = "server2", .region = "us-west" }));
+
+    try gauge.add(.{ .host = "server1", .region = "us-east" }, 512.0);
+    try std.testing.expectEqual(1536.0, try gauge.get(.{ .host = "server1", .region = "us-east" }));
+}
+
+test "Gauge with RuntimeLabels" {
+    const RuntimeLabels = @import("labels.zig").RuntimeLabels;
+
+    var gauge = try Gauge(RuntimeLabels, .{}).init(
+        std.testing.allocator,
+        "temperature_celsius",
+        "Temperature in Celsius",
+    );
+    defer gauge.deinit();
+
+    const keys = [_][]const u8{"location"};
+    const values1 = [_][]const u8{"indoor"};
+    const values2 = [_][]const u8{"outdoor"};
+
+    const labels1 = try RuntimeLabels.init(&keys, &values1);
+    const labels2 = try RuntimeLabels.init(&keys, &values2);
+
+    try gauge.set(labels1, 22.5);
+    try gauge.set(labels2, 15.0);
+
+    try std.testing.expectEqual(22.5, try gauge.get(labels1));
+    try std.testing.expectEqual(15.0, try gauge.get(labels2));
+}

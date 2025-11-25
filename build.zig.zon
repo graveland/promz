@@ -1,0 +1,14 @@
+.{
+    .name = .promz,
+    .version = "0.1.0",
+    .fingerprint = 0xddce7e10a1021de0,
+    .minimum_zig_version = "0.16.0-dev.1316+181b25ce4",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}
