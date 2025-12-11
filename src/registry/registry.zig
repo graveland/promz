@@ -16,11 +16,20 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
+        self.deinitWithOptions(true);
+    }
+
+    /// Deinit the registry with control over whether to deinit collectors.
+    /// If deinit_collectors is false, only the collector list is freed but
+    /// collectors themselves are not deinitialized (caller manages lifecycle).
+    pub fn deinitWithOptions(self: *Registry, deinit_collectors: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        for (self.collectors.items) |collector| {
-            collector.deinit();
+        if (deinit_collectors) {
+            for (self.collectors.items) |collector| {
+                collector.deinit();
+            }
         }
         self.collectors.deinit(self.allocator);
     }

@@ -24,6 +24,17 @@ pub const MetricsServer = struct {
     server: ?std.Io.net.Server,
     running: std.atomic.Value(bool),
     server_thread: ?std.Thread,
+    logger: ?Logger,
+
+    /// Type-erased logger interface for error reporting
+    pub const Logger = struct {
+        ptr: *anyopaque,
+        errFn: *const fn (ptr: *anyopaque, msg: []const u8, err_name: ?[]const u8) void,
+
+        pub fn err(self: Logger, msg: []const u8, err_name: ?[]const u8) void {
+            self.errFn(self.ptr, msg, err_name);
+        }
+    };
 
     pub const Config = struct {
         /// The address to bind to (default: "127.0.0.1")
@@ -45,6 +56,7 @@ pub const MetricsServer = struct {
             .server = null,
             .running = std.atomic.Value(bool).init(false),
             .server_thread = null,
+            .logger = null,
         };
     }
 
@@ -62,7 +74,26 @@ pub const MetricsServer = struct {
             .server = null,
             .running = std.atomic.Value(bool).init(false),
             .server_thread = null,
+            .logger = null,
         };
+    }
+
+    /// Set a logger for error reporting. If set, errors will be logged through
+    /// this logger instead of std.log.
+    pub fn setLogger(self: *MetricsServer, logger: Logger) void {
+        self.logger = logger;
+    }
+
+    fn logError(self: *MetricsServer, msg: []const u8, err_name: ?[]const u8) void {
+        if (self.logger) |logger| {
+            logger.err(msg, err_name);
+        } else {
+            if (err_name) |name| {
+                std.log.err("{s}: {s}", .{ msg, name });
+            } else {
+                std.log.err("{s}", .{msg});
+            }
+        }
     }
 
     /// Clean up server resources.
@@ -90,7 +121,6 @@ pub const MetricsServer = struct {
         });
 
         self.running.store(true, .release);
-        std.log.info("Metrics server listening on http://{s}:{d}/metrics", .{ config.address, config.port });
 
         while (self.running.load(.acquire)) {
             // Use poll with timeout to allow checking running flag periodically
@@ -104,7 +134,7 @@ pub const MetricsServer = struct {
 
             const poll_result = std.posix.poll(&poll_fds, 100) catch |err| {
                 if (!self.running.load(.acquire)) break;
-                std.log.err("Poll failed: {}", .{err});
+                self.logError("Poll failed", @errorName(err));
                 continue;
             };
 
@@ -118,12 +148,12 @@ pub const MetricsServer = struct {
 
             const stream = self.server.?.accept(self.io) catch |err| {
                 if (!self.running.load(.acquire)) break;
-                std.log.err("Accept failed: {}", .{err});
+                self.logError("Accept failed", @errorName(err));
                 continue;
             };
 
             // Handle connection directly (single-threaded for now)
-            handleConnection(self.allocator, self.io, stream, self.registry);
+            self.handleConnection(stream);
         }
     }
 
@@ -136,7 +166,7 @@ pub const MetricsServer = struct {
 
     fn serveWrapper(self: *MetricsServer, config: Config) void {
         self.serve(config) catch |err| {
-            std.log.err("Server error: {}", .{err});
+            self.logError("Server error", @errorName(err));
         };
     }
 
@@ -161,19 +191,14 @@ pub const MetricsServer = struct {
         return self.running.load(.acquire);
     }
 
-    fn handleConnection(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        stream: std.Io.net.Stream,
-        registry: *Registry,
-    ) void {
-        defer stream.close(io);
+    fn handleConnection(self: *MetricsServer, stream: std.Io.net.Stream) void {
+        defer stream.close(self.io);
 
         var read_buf: [8192]u8 = undefined;
         var write_buf: [8192]u8 = undefined;
 
-        var reader = stream.reader(io, &read_buf);
-        var writer = stream.writer(io, &write_buf);
+        var reader = stream.reader(self.io, &read_buf);
+        var writer = stream.writer(self.io, &write_buf);
 
         var http_server = std.http.Server.init(&reader.interface, &writer.interface);
 
@@ -182,7 +207,7 @@ pub const MetricsServer = struct {
             var request = http_server.receiveHead() catch break;
 
             if (std.mem.eql(u8, request.head.target, "/metrics")) {
-                handleMetricsRequest(allocator, &request, registry);
+                self.handleMetricsRequest(&request);
             } else {
                 handleNotFound(&request);
             }
@@ -191,29 +216,23 @@ pub const MetricsServer = struct {
         }
     }
 
-    fn handleMetricsRequest(
-        allocator: std.mem.Allocator,
-        request: *std.http.Server.Request,
-        registry: *Registry,
-    ) void {
+    fn handleMetricsRequest(self: *MetricsServer, request: *std.http.Server.Request) void {
         // Use the registry's built-in gatherToString which is thread-safe
-        const metrics = registry.gatherToString() catch |err| {
-            std.log.err("gatherToString failed: {}", .{err});
+        const metrics = self.registry.gatherToString() catch |err| {
+            self.logError("gatherToString failed", @errorName(err));
             request.respond("Internal Server Error\n", .{
                 .status = .internal_server_error,
             }) catch {};
             return;
         };
-        defer allocator.free(metrics);
-
-        std.log.info("Serving {} bytes of metrics", .{metrics.len});
+        defer self.allocator.free(metrics);
 
         request.respond(metrics, .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "text/plain; version=0.0.4; charset=utf-8" },
             },
         }) catch |err| {
-            std.log.err("respond failed: {}", .{err});
+            self.logError("respond failed", @errorName(err));
         };
     }
 
