@@ -137,6 +137,15 @@ pub const MetricCollector = struct {
         const metrics = self.metrics.items;
         const fns = self.collect_fns.items;
 
+        if (metrics.len != fns.len) {
+            std.log.err("MetricCollector '{s}' has mismatched lengths: metrics={d}, fns={d}", .{
+                self.name,
+                metrics.len,
+                fns.len,
+            });
+            return error.MismatchedLengths;
+        }
+
         const writer = Writer{ .ptr = writer_ptr, .writeFn = writeFn };
 
         for (metrics, fns) |metric, collect_fn| {
