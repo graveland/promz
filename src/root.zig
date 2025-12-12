@@ -17,6 +17,15 @@ pub const GaugeConfig = @import("core/gauge.zig").GaugeConfig;
 pub const Histogram = @import("core/histogram.zig").Histogram;
 pub const HistogramConfig = @import("core/histogram.zig").HistogramConfig;
 pub const BucketConfig = @import("core/histogram.zig").BucketConfig;
+pub const defaultBuckets = @import("core/histogram.zig").defaultBuckets;
+pub const DEFAULT_BUCKETS = @import("core/histogram.zig").DEFAULT_BUCKETS;
+
+// Noop support for disabled metrics
+pub const RegistryOpts = @import("core/noop.zig").RegistryOpts;
+pub const initializeNoop = @import("core/noop.zig").initializeNoop;
+
+// Direct write support (write metrics without registry)
+pub const write = @import("core/write.zig").write;
 
 // Label support
 pub const NoLabels = @import("core/labels.zig").NoLabels;

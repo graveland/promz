@@ -11,6 +11,7 @@ const RuntimeLabels = @import("labels.zig").RuntimeLabels;
 const generateLabelKey = @import("labels.zig").generateLabelKey;
 const generateLabelKeyBuf = @import("labels.zig").generateLabelKeyBuf;
 const hashStructLabels = @import("labels.zig").hashStructLabels;
+const writeValue = @import("format.zig").writeValue;
 
 /// Configuration for Counter behavior
 pub const CounterConfig = struct {
@@ -24,12 +25,150 @@ pub const CounterConfig = struct {
     cache_size: usize = 32,
 };
 
+/// Validate that V is a valid counter type (unsigned integer or float)
+fn assertCounterType(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .float => return,
+        .int => |int| {
+            if (int.signedness == .unsigned) return;
+        },
+        else => {},
+    }
+    @compileError("Counter requires an unsigned integer (u32, u64) or float (f32, f64). " ++
+        "Signed integers are not allowed because counters can only increase. Got: " ++ @typeName(T));
+}
+
 /// Counter - a monotonically increasing metric
 /// Counters can only increase (or be reset to zero)
-/// Generic over label type TLabels for compile-time type safety
-pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
+/// Generic over:
+/// - V: the value type (u32, u64, f32, f64)
+/// - TLabels: the label type for compile-time type safety
+/// - config: configuration options
+///
+/// This is a union type that supports noop mode for zero-cost disabled metrics.
+/// Use `.noop` for disabled metrics or call `init()` for active metrics.
+pub fn Counter(comptime V: type, comptime TLabels: type, comptime config: CounterConfig) type {
+    assertCounterType(V);
+
+    return union(enum) {
+        const Self = @This();
+        pub const Labels = TLabels;
+        pub const ValueType = V;
+
+        noop: void,
+        impl: Impl,
+
+        /// Initialize an active counter with the given name and help text
+        pub fn init(
+            allocator: std.mem.Allocator,
+            name: []const u8,
+            help: []const u8,
+        ) !Self {
+            return .{ .impl = try Impl.init(allocator, name, help) };
+        }
+
+        /// Clean up resources
+        pub fn deinit(self: *Self) void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| impl.deinit(),
+            }
+        }
+
+        /// Increment counter by 1
+        pub fn inc(self: *Self, labels: TLabels) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.inc(labels),
+            }
+        }
+
+        /// Add a positive value to the counter
+        pub fn add(self: *Self, labels: TLabels, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.add(labels, value),
+            }
+        }
+
+        /// Pre-register a label combination for O(1) access
+        pub fn register(self: *Self, labels: TLabels) !LabelHandle {
+            switch (self.*) {
+                .noop => return LabelHandle{ .index = 0, .generation = 0 },
+                .impl => |*impl| return impl.register(labels),
+            }
+        }
+
+        /// Increment by 1 using a pre-registered handle
+        pub fn incByHandle(self: *Self, handle: LabelHandle) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.incByHandle(handle),
+            }
+        }
+
+        /// Add value using a pre-registered handle
+        pub fn addByHandle(self: *Self, handle: LabelHandle, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.addByHandle(handle, value),
+            }
+        }
+
+        /// Get value using a pre-registered handle
+        pub fn getByHandle(self: *const Self, handle: LabelHandle) !V {
+            const is_integer = @typeInfo(V) == .int;
+            const zero: V = if (is_integer) 0 else 0.0;
+            switch (self.*) {
+                .noop => return zero,
+                .impl => |*impl| return impl.getByHandle(handle),
+            }
+        }
+
+        /// Get the current counter value
+        pub fn get(self: *const Self, labels: TLabels) !V {
+            const is_integer = @typeInfo(V) == .int;
+            const zero: V = if (is_integer) 0 else 0.0;
+            switch (self.*) {
+                .noop => return zero,
+                .impl => |*impl| return impl.get(labels),
+            }
+        }
+
+        /// Reset counter to zero
+        pub fn reset(self: *Self) void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| impl.reset(),
+            }
+        }
+
+        /// Get metric info (returns null for noop)
+        pub fn getInfo(self: *const Self) ?MetricInfo {
+            switch (self.*) {
+                .noop => return null,
+                .impl => |*impl| return impl.info,
+            }
+        }
+
+        /// Write the metric in Prometheus text exposition format to any writer
+        /// This allows metrics to write themselves directly without a registry
+        pub fn write(self: *const Self, writer: anytype) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.write(writer),
+            }
+        }
+
+        /// The implementation type (for advanced usage)
+        pub const Impl = CounterImpl(V, TLabels, config);
+    };
+}
+
+/// Internal implementation of Counter (extracted for union wrapper)
+fn CounterImpl(comptime V: type, comptime TLabels: type, comptime config: CounterConfig) type {
     // Choose sample type based on thread safety config
-    const SampleType = if (config.thread_safe) AtomicSample else Sample;
+    const SampleType = if (config.thread_safe) AtomicSample(V) else Sample(V);
 
     // Optimization: NoLabels uses a single sample instead of HashMap
     const use_single_sample = (TLabels == NoLabels);
@@ -37,12 +176,17 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
     // Check if we can use comptime hash for faster lookups (struct labels only)
     const use_comptime_hash = !use_single_sample and (TLabels != RuntimeLabels);
 
+    const is_integer = @typeInfo(V) == .int;
+    const zero: V = if (is_integer) 0 else 0.0;
+    const one: V = if (is_integer) 1 else 1.0;
+
     return struct {
         const Self = @This();
         // Store pointers to heap-allocated samples for pointer stability
         // This ensures cached pointers remain valid even when HashMap resizes
         const SampleMap = std.StringHashMap(*SampleType);
         pub const Labels = TLabels;
+        pub const ValueType = V;
 
         // Thread-local cache constants (comptime configurable via config.cache_size)
         const CACHE_SIZE = config.cache_size;
@@ -85,7 +229,7 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
                 return Self{
                     .allocator = allocator,
                     .info = info,
-                    .sample = if (config.thread_safe) SampleType.init() else SampleType.init(0.0),
+                    .sample = if (config.thread_safe) SampleType.init() else SampleType.init(zero),
                     .samples = {},
                     .samples_array = {},
                     .generation = 0,
@@ -126,14 +270,17 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
 
         /// Increment counter by 1
         pub fn inc(self: *Self, labels: TLabels) !void {
-            return self.add(labels, 1.0);
+            return self.add(labels, one);
         }
 
         /// Add a positive value to the counter
-        /// Returns error if value is negative
-        pub fn add(self: *Self, labels: TLabels, value: f64) !void {
-            if (value < 0) {
-                return MetricError.NegativeCounterValue;
+        /// Returns error if value is negative (for floats)
+        pub fn add(self: *Self, labels: TLabels, value: V) !void {
+            // For floats, check for negative values
+            if (!is_integer) {
+                if (value < zero) {
+                    return MetricError.NegativeCounterValue;
+                }
             }
 
             if (use_single_sample) {
@@ -165,12 +312,15 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
 
         /// Increment by 1 using a pre-registered handle (O(1) with validation)
         pub fn incByHandle(self: *Self, handle: LabelHandle) !void {
-            return self.addByHandle(handle, 1.0);
+            return self.addByHandle(handle, one);
         }
 
         /// Add value using a pre-registered handle (O(1) with validation)
-        pub fn addByHandle(self: *Self, handle: LabelHandle, value: f64) !void {
-            if (value < 0) return MetricError.NegativeCounterValue;
+        pub fn addByHandle(self: *Self, handle: LabelHandle, value: V) !void {
+            // For floats, check for negative values
+            if (!is_integer) {
+                if (value < zero) return MetricError.NegativeCounterValue;
+            }
 
             if (use_single_sample) {
                 try self.validateHandle(handle);
@@ -182,7 +332,7 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
         }
 
         /// Get value using a pre-registered handle (O(1) with validation)
-        pub fn getByHandle(self: *const Self, handle: LabelHandle) !f64 {
+        pub fn getByHandle(self: *const Self, handle: LabelHandle) !V {
             if (use_single_sample) {
                 try self.validateHandle(handle);
                 return self.sample.get();
@@ -203,7 +353,7 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
 
         /// Get the current counter value
         /// This is primarily for testing and debugging
-        pub fn get(self: *const Self, labels: TLabels) !f64 {
+        pub fn get(self: *const Self, labels: TLabels) !V {
             if (use_single_sample) {
                 return self.sample.get();
             } else {
@@ -218,11 +368,11 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
         /// Reset counter to zero (for testing)
         pub fn reset(self: *Self) void {
             if (use_single_sample) {
-                self.sample.set(0.0);
+                self.sample.set(zero);
             } else {
                 var it = self.samples.valueIterator();
                 while (it.next()) |sample_ptr| {
-                    sample_ptr.*.set(0.0);
+                    sample_ptr.*.set(zero);
                 }
             }
             // Increment generation to invalidate handles
@@ -270,7 +420,7 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
             // Cold path: allocate new sample on heap (pointer-stable)
             const sample_ptr = try self.allocator.create(SampleType);
             errdefer self.allocator.destroy(sample_ptr);
-            sample_ptr.* = if (config.thread_safe) SampleType.init() else SampleType.init(0.0);
+            sample_ptr.* = if (config.thread_safe) SampleType.init() else SampleType.init(zero);
 
             // Allocate key for storage in HashMap
             const owned_key = try generateLabelKey(self.allocator, TLabels, labels);
@@ -311,11 +461,51 @@ pub fn Counter(comptime TLabels: type, comptime config: CounterConfig) type {
             };
             tl_lru_tick +%= 1;
         }
+
+        /// Write the metric in Prometheus text exposition format to any writer
+        pub fn write(self: *const Self, writer: anytype) !void {
+            // Write HELP line
+            try writer.writeAll("# HELP ");
+            try writer.writeAll(self.info.name);
+            try writer.writeAll(" ");
+            try writer.writeAll(self.info.help);
+            try writer.writeAll("\n");
+
+            // Write TYPE line
+            try writer.writeAll("# TYPE ");
+            try writer.writeAll(self.info.name);
+            try writer.writeAll(" counter\n");
+
+            // Write samples
+            if (use_single_sample) {
+                try writer.writeAll(self.info.name);
+                try writer.writeAll(" ");
+                try writeValue(V, writer, self.sample.get());
+                try writer.writeAll("\n");
+            } else {
+                var it = self.samples.iterator();
+                while (it.next()) |entry| {
+                    try writer.writeAll(self.info.name);
+                    if (entry.key_ptr.len > 0) {
+                        try writer.writeAll("{");
+                        try writer.writeAll(entry.key_ptr.*);
+                        try writer.writeAll("}");
+                    }
+                    try writer.writeAll(" ");
+                    try writeValue(V, writer, entry.value_ptr.*.get());
+                    try writer.writeAll("\n");
+                }
+            }
+        }
     };
 }
 
-test "Counter(NoLabels): init and basic operations" {
-    var counter = try Counter(NoLabels, .{}).init(
+// ============================================================================
+// Tests with f64 (original behavior)
+// ============================================================================
+
+test "Counter(f64, NoLabels): init and basic operations" {
+    var counter = try Counter(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "A test counter",
@@ -323,11 +513,11 @@ test "Counter(NoLabels): init and basic operations" {
     defer counter.deinit();
 
     try std.testing.expectEqual(0.0, try counter.get(.{}));
-    try std.testing.expectEqualStrings("test_counter", counter.info.name);
+    try std.testing.expectEqualStrings("test_counter", counter.getInfo().?.name);
 }
 
-test "Counter(NoLabels): inc" {
-    var counter = try Counter(NoLabels, .{}).init(
+test "Counter(f64, NoLabels): inc" {
+    var counter = try Counter(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "Test",
@@ -341,8 +531,8 @@ test "Counter(NoLabels): inc" {
     try std.testing.expectEqual(2.0, try counter.get(.{}));
 }
 
-test "Counter(NoLabels): add" {
-    var counter = try Counter(NoLabels, .{}).init(
+test "Counter(f64, NoLabels): add" {
+    var counter = try Counter(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "Test",
@@ -356,8 +546,8 @@ test "Counter(NoLabels): add" {
     try std.testing.expectEqual(7.5, try counter.get(.{}));
 }
 
-test "Counter(NoLabels): negative value rejected" {
-    var counter = try Counter(NoLabels, .{}).init(
+test "Counter(f64, NoLabels): negative value rejected" {
+    var counter = try Counter(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "Test",
@@ -368,13 +558,13 @@ test "Counter(NoLabels): negative value rejected" {
     try std.testing.expectError(MetricError.NegativeCounterValue, result);
 }
 
-test "Counter with struct labels" {
+test "Counter(f64) with struct labels" {
     const Labels = struct {
         method: []const u8,
         status: []const u8,
     };
 
-    var counter = try Counter(Labels, .{}).init(
+    var counter = try Counter(f64, Labels, .{}).init(
         std.testing.allocator,
         "http_requests_total",
         "Total HTTP requests",
@@ -389,10 +579,8 @@ test "Counter with struct labels" {
     try std.testing.expectEqual(1.0, try counter.get(.{ .method = "POST", .status = "201" }));
 }
 
-test "Counter with RuntimeLabels" {
-    // RuntimeLabels already imported at top of file
-
-    var counter = try Counter(RuntimeLabels, .{}).init(
+test "Counter(f64) with RuntimeLabels" {
+    var counter = try Counter(f64, RuntimeLabels, .{}).init(
         std.testing.allocator,
         "dynamic_counter",
         "Counter with dynamic labels",
@@ -415,13 +603,13 @@ test "Counter with RuntimeLabels" {
     try std.testing.expectEqual(1.0, try counter.get(labels2));
 }
 
-test "Counter with pre-registered labels (handles)" {
+test "Counter(f64) with pre-registered labels (handles)" {
     const Labels = struct {
         method: []const u8,
         status: []const u8,
     };
 
-    var counter = try Counter(Labels, .{}).init(
+    var counter = try Counter(f64, Labels, .{}).init(
         std.testing.allocator,
         "http_requests_total",
         "Total HTTP requests",
@@ -443,12 +631,12 @@ test "Counter with pre-registered labels (handles)" {
     try std.testing.expectEqual(5.0, try counter.getByHandle(post_201));
 }
 
-test "Counter handle validation: stale handle after reset" {
+test "Counter(f64) handle validation: stale handle after reset" {
     const Labels = struct {
         method: []const u8,
     };
 
-    var counter = try Counter(Labels, .{}).init(
+    var counter = try Counter(f64, Labels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "Test",
@@ -467,8 +655,8 @@ test "Counter handle validation: stale handle after reset" {
     try std.testing.expectError(MetricError.StaleHandle, result);
 }
 
-test "Counter(NoLabels) with pre-registered handle" {
-    var counter = try Counter(NoLabels, .{}).init(
+test "Counter(f64, NoLabels) with pre-registered handle" {
+    var counter = try Counter(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "Test",
@@ -483,12 +671,12 @@ test "Counter(NoLabels) with pre-registered handle" {
     try std.testing.expectEqual(5.0, try counter.get(.{}));
 }
 
-test "Counter with thread-local cache config" {
+test "Counter(f64) with thread-local cache config" {
     const Labels = struct {
         method: []const u8,
     };
 
-    var counter = try Counter(Labels, .{ .thread_local_cache = true }).init(
+    var counter = try Counter(f64, Labels, .{ .thread_local_cache = true }).init(
         std.testing.allocator,
         "test_counter",
         "Test",
@@ -501,4 +689,148 @@ test "Counter with thread-local cache config" {
     try counter.inc(.{ .method = "GET" });
 
     try std.testing.expectEqual(3.0, try counter.get(.{ .method = "GET" }));
+}
+
+// ============================================================================
+// Tests with u64 (new integer support)
+// ============================================================================
+
+test "Counter(u64, NoLabels): init and basic operations" {
+    var counter = try Counter(u64, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_counter",
+        "A test counter",
+    );
+    defer counter.deinit();
+
+    try std.testing.expectEqual(0, try counter.get(.{}));
+}
+
+test "Counter(u64, NoLabels): inc and add" {
+    var counter = try Counter(u64, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_counter",
+        "Test",
+    );
+    defer counter.deinit();
+
+    try counter.inc(.{});
+    try std.testing.expectEqual(1, try counter.get(.{}));
+
+    try counter.add(.{}, 10);
+    try std.testing.expectEqual(11, try counter.get(.{}));
+}
+
+test "Counter(u64) with struct labels" {
+    const Labels = struct {
+        method: []const u8,
+    };
+
+    var counter = try Counter(u64, Labels, .{}).init(
+        std.testing.allocator,
+        "requests",
+        "Request counter",
+    );
+    defer counter.deinit();
+
+    try counter.inc(.{ .method = "GET" });
+    try counter.inc(.{ .method = "POST" });
+    try counter.inc(.{ .method = "GET" });
+
+    try std.testing.expectEqual(2, try counter.get(.{ .method = "GET" }));
+    try std.testing.expectEqual(1, try counter.get(.{ .method = "POST" }));
+}
+
+test "Counter(u64) with handles" {
+    var counter = try Counter(u64, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_counter",
+        "Test",
+    );
+    defer counter.deinit();
+
+    const handle = try counter.register(.{});
+    try counter.incByHandle(handle);
+    try counter.addByHandle(handle, 99);
+
+    try std.testing.expectEqual(100, try counter.getByHandle(handle));
+}
+
+// ============================================================================
+// Tests with u32 (smaller integer)
+// ============================================================================
+
+test "Counter(u32, NoLabels): basic operations" {
+    var counter = try Counter(u32, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_counter",
+        "Test",
+    );
+    defer counter.deinit();
+
+    try counter.inc(.{});
+    try counter.add(.{}, 100);
+    try std.testing.expectEqual(101, try counter.get(.{}));
+}
+
+// ============================================================================
+// Thread-safe counter tests
+// ============================================================================
+
+test "Counter(u64, NoLabels, thread_safe): basic operations" {
+    var counter = try Counter(u64, NoLabels, .{ .thread_safe = true }).init(
+        std.testing.allocator,
+        "test_counter",
+        "Test",
+    );
+    defer counter.deinit();
+
+    try counter.inc(.{});
+    try counter.add(.{}, 10);
+    try std.testing.expectEqual(11, try counter.get(.{}));
+}
+
+test "Counter(f64, NoLabels, thread_safe): basic operations" {
+    var counter = try Counter(f64, NoLabels, .{ .thread_safe = true }).init(
+        std.testing.allocator,
+        "test_counter",
+        "Test",
+    );
+    defer counter.deinit();
+
+    try counter.inc(.{});
+    try counter.add(.{}, 2.5);
+    try std.testing.expectEqual(3.5, try counter.get(.{}));
+}
+
+// ============================================================================
+// Noop tests
+// ============================================================================
+
+test "Counter noop: operations are no-ops" {
+    var counter: Counter(f64, NoLabels, .{}) = .noop;
+
+    // All operations should succeed silently
+    try counter.inc(.{});
+    try counter.add(.{}, 5.0);
+    counter.reset();
+    counter.deinit();
+
+    // Get returns zero
+    try std.testing.expectEqual(0.0, try counter.get(.{}));
+}
+
+test "Counter noop: handles work" {
+    var counter: Counter(u64, NoLabels, .{}) = .noop;
+
+    const handle = try counter.register(.{});
+    try counter.incByHandle(handle);
+    try counter.addByHandle(handle, 10);
+
+    try std.testing.expectEqual(0, try counter.getByHandle(handle));
+}
+
+test "Counter noop: getInfo returns null" {
+    const counter: Counter(f64, NoLabels, .{}) = .noop;
+    try std.testing.expect(counter.getInfo() == null);
 }

@@ -11,6 +11,7 @@ const RuntimeLabels = @import("labels.zig").RuntimeLabels;
 const generateLabelKey = @import("labels.zig").generateLabelKey;
 const generateLabelKeyBuf = @import("labels.zig").generateLabelKeyBuf;
 const hashStructLabels = @import("labels.zig").hashStructLabels;
+const writeValue = @import("format.zig").writeValue;
 
 /// Configuration for Gauge behavior
 pub const GaugeConfig = struct {
@@ -24,12 +25,187 @@ pub const GaugeConfig = struct {
     cache_size: usize = 32,
 };
 
+/// Validate that V is a valid gauge type (any integer or float)
+fn assertGaugeType(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .float => return,
+        .int => return,
+        else => {},
+    }
+    @compileError("Gauge metric must be an integer or a float, got: " ++ @typeName(T));
+}
+
 /// Gauge - a metric that can go up or down
 /// Unlike counters, gauges can be incremented, decremented, or set to arbitrary values
-/// Generic over label type TLabels for compile-time type safety
-pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
+/// Generic over:
+/// - V: the value type (i32, i64, u32, u64, f32, f64)
+/// - TLabels: the label type for compile-time type safety
+/// - config: configuration options
+///
+/// This is a union type that supports noop mode for zero-cost disabled metrics.
+/// Use `.noop` for disabled metrics or call `init()` for active metrics.
+pub fn Gauge(comptime V: type, comptime TLabels: type, comptime config: GaugeConfig) type {
+    assertGaugeType(V);
+
+    return union(enum) {
+        const Self = @This();
+        pub const Labels = TLabels;
+        pub const ValueType = V;
+
+        noop: void,
+        impl: Impl,
+
+        /// Initialize an active gauge with the given name and help text
+        pub fn init(
+            allocator: std.mem.Allocator,
+            name: []const u8,
+            help: []const u8,
+        ) !Self {
+            return .{ .impl = try Impl.init(allocator, name, help) };
+        }
+
+        /// Clean up resources
+        pub fn deinit(self: *Self) void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| impl.deinit(),
+            }
+        }
+
+        /// Increment gauge by 1
+        pub fn inc(self: *Self, labels: TLabels) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.inc(labels),
+            }
+        }
+
+        /// Decrement gauge by 1
+        pub fn dec(self: *Self, labels: TLabels) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.dec(labels),
+            }
+        }
+
+        /// Add a value to the gauge
+        pub fn add(self: *Self, labels: TLabels, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.add(labels, value),
+            }
+        }
+
+        /// Subtract a value from the gauge
+        pub fn sub(self: *Self, labels: TLabels, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.sub(labels, value),
+            }
+        }
+
+        /// Set the gauge to an absolute value
+        pub fn set(self: *Self, labels: TLabels, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.set(labels, value),
+            }
+        }
+
+        /// Pre-register a label combination for O(1) access
+        pub fn register(self: *Self, labels: TLabels) !LabelHandle {
+            switch (self.*) {
+                .noop => return LabelHandle{ .index = 0, .generation = 0 },
+                .impl => |*impl| return impl.register(labels),
+            }
+        }
+
+        /// Increment by 1 using a pre-registered handle
+        pub fn incByHandle(self: *Self, handle: LabelHandle) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.incByHandle(handle),
+            }
+        }
+
+        /// Decrement by 1 using a pre-registered handle
+        pub fn decByHandle(self: *Self, handle: LabelHandle) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.decByHandle(handle),
+            }
+        }
+
+        /// Add value using a pre-registered handle
+        pub fn addByHandle(self: *Self, handle: LabelHandle, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.addByHandle(handle, value),
+            }
+        }
+
+        /// Subtract value using a pre-registered handle
+        pub fn subByHandle(self: *Self, handle: LabelHandle, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.subByHandle(handle, value),
+            }
+        }
+
+        /// Set value using a pre-registered handle
+        pub fn setByHandle(self: *Self, handle: LabelHandle, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.setByHandle(handle, value),
+            }
+        }
+
+        /// Get value using a pre-registered handle
+        pub fn getByHandle(self: *const Self, handle: LabelHandle) !V {
+            const is_integer = @typeInfo(V) == .int;
+            const zero: V = if (is_integer) 0 else 0.0;
+            switch (self.*) {
+                .noop => return zero,
+                .impl => |*impl| return impl.getByHandle(handle),
+            }
+        }
+
+        /// Get the current gauge value
+        pub fn get(self: *const Self, labels: TLabels) !V {
+            const is_integer = @typeInfo(V) == .int;
+            const zero: V = if (is_integer) 0 else 0.0;
+            switch (self.*) {
+                .noop => return zero,
+                .impl => |*impl| return impl.get(labels),
+            }
+        }
+
+        /// Get metric info (returns null for noop)
+        pub fn getInfo(self: *const Self) ?MetricInfo {
+            switch (self.*) {
+                .noop => return null,
+                .impl => |*impl| return impl.info,
+            }
+        }
+
+        /// Write the metric in Prometheus text exposition format to any writer
+        /// This allows metrics to write themselves directly without a registry
+        pub fn write(self: *const Self, writer: anytype) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.write(writer),
+            }
+        }
+
+        /// The implementation type (for advanced usage)
+        pub const Impl = GaugeImpl(V, TLabels, config);
+    };
+}
+
+/// Internal implementation of Gauge (extracted for union wrapper)
+fn GaugeImpl(comptime V: type, comptime TLabels: type, comptime config: GaugeConfig) type {
     // Choose sample type based on thread safety config
-    const SampleType = if (config.thread_safe) AtomicSample else Sample;
+    const SampleType = if (config.thread_safe) AtomicSample(V) else Sample(V);
 
     // Optimization: NoLabels uses a single sample instead of HashMap
     const use_single_sample = (TLabels == NoLabels);
@@ -37,12 +213,17 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
     // Check if we can use comptime hash for faster lookups (struct labels only)
     const use_comptime_hash = !use_single_sample and (TLabels != RuntimeLabels);
 
+    const is_integer = @typeInfo(V) == .int;
+    const zero: V = if (is_integer) 0 else 0.0;
+    const one: V = if (is_integer) 1 else 1.0;
+
     return struct {
         const Self = @This();
         // Store pointers to heap-allocated samples for pointer stability
         // This ensures cached pointers remain valid even when HashMap resizes
         const SampleMap = std.StringHashMap(*SampleType);
         pub const Labels = TLabels;
+        pub const ValueType = V;
 
         // Thread-local cache constants (comptime configurable via config.cache_size)
         const CACHE_SIZE = config.cache_size;
@@ -85,7 +266,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
                 return Self{
                     .allocator = allocator,
                     .info = info,
-                    .sample = if (config.thread_safe) SampleType.init() else SampleType.init(0.0),
+                    .sample = if (config.thread_safe) SampleType.init() else SampleType.init(zero),
                     .samples = {},
                     .samples_array = {},
                     .generation = 0,
@@ -124,16 +305,16 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
 
         /// Increment gauge by 1
         pub fn inc(self: *Self, labels: TLabels) !void {
-            return self.add(labels, 1.0);
+            return self.add(labels, one);
         }
 
         /// Decrement gauge by 1
         pub fn dec(self: *Self, labels: TLabels) !void {
-            return self.sub(labels, 1.0);
+            return self.sub(labels, one);
         }
 
         /// Add a value to the gauge (can be positive or negative)
-        pub fn add(self: *Self, labels: TLabels, value: f64) !void {
+        pub fn add(self: *Self, labels: TLabels, value: V) !void {
             if (use_single_sample) {
                 self.sample.add(value);
             } else {
@@ -143,7 +324,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
         }
 
         /// Subtract a value from the gauge
-        pub fn sub(self: *Self, labels: TLabels, value: f64) !void {
+        pub fn sub(self: *Self, labels: TLabels, value: V) !void {
             if (use_single_sample) {
                 self.sample.sub(value);
             } else {
@@ -153,7 +334,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
         }
 
         /// Set the gauge to an absolute value
-        pub fn set(self: *Self, labels: TLabels, value: f64) !void {
+        pub fn set(self: *Self, labels: TLabels, value: V) !void {
             if (use_single_sample) {
                 self.sample.set(value);
             } else {
@@ -177,16 +358,16 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
 
         /// Increment by 1 using a pre-registered handle
         pub fn incByHandle(self: *Self, handle: LabelHandle) !void {
-            return self.addByHandle(handle, 1.0);
+            return self.addByHandle(handle, one);
         }
 
         /// Decrement by 1 using a pre-registered handle
         pub fn decByHandle(self: *Self, handle: LabelHandle) !void {
-            return self.subByHandle(handle, 1.0);
+            return self.subByHandle(handle, one);
         }
 
         /// Add value using a pre-registered handle
-        pub fn addByHandle(self: *Self, handle: LabelHandle, value: f64) !void {
+        pub fn addByHandle(self: *Self, handle: LabelHandle, value: V) !void {
             if (use_single_sample) {
                 try self.validateHandle(handle);
                 self.sample.add(value);
@@ -197,7 +378,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
         }
 
         /// Subtract value using a pre-registered handle
-        pub fn subByHandle(self: *Self, handle: LabelHandle, value: f64) !void {
+        pub fn subByHandle(self: *Self, handle: LabelHandle, value: V) !void {
             if (use_single_sample) {
                 try self.validateHandle(handle);
                 self.sample.sub(value);
@@ -208,7 +389,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
         }
 
         /// Set value using a pre-registered handle
-        pub fn setByHandle(self: *Self, handle: LabelHandle, value: f64) !void {
+        pub fn setByHandle(self: *Self, handle: LabelHandle, value: V) !void {
             if (use_single_sample) {
                 try self.validateHandle(handle);
                 self.sample.set(value);
@@ -219,7 +400,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
         }
 
         /// Get value using a pre-registered handle
-        pub fn getByHandle(self: *const Self, handle: LabelHandle) !f64 {
+        pub fn getByHandle(self: *const Self, handle: LabelHandle) !V {
             if (use_single_sample) {
                 try self.validateHandle(handle);
                 return self.sample.get();
@@ -239,7 +420,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
         }
 
         /// Get the current gauge value
-        pub fn get(self: *const Self, labels: TLabels) !f64 {
+        pub fn get(self: *const Self, labels: TLabels) !V {
             if (use_single_sample) {
                 return self.sample.get();
             } else {
@@ -282,7 +463,7 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
             // Cold path: allocate new sample on heap (pointer-stable)
             const sample_ptr = try self.allocator.create(SampleType);
             errdefer self.allocator.destroy(sample_ptr);
-            sample_ptr.* = if (config.thread_safe) SampleType.init() else SampleType.init(0.0);
+            sample_ptr.* = if (config.thread_safe) SampleType.init() else SampleType.init(zero);
 
             // Allocate key for storage in HashMap
             const owned_key = try generateLabelKey(self.allocator, TLabels, labels);
@@ -322,11 +503,51 @@ pub fn Gauge(comptime TLabels: type, comptime config: GaugeConfig) type {
             };
             tl_lru_tick +%= 1;
         }
+
+        /// Write the metric in Prometheus text exposition format to any writer
+        pub fn write(self: *const Self, writer: anytype) !void {
+            // Write HELP line
+            try writer.writeAll("# HELP ");
+            try writer.writeAll(self.info.name);
+            try writer.writeAll(" ");
+            try writer.writeAll(self.info.help);
+            try writer.writeAll("\n");
+
+            // Write TYPE line
+            try writer.writeAll("# TYPE ");
+            try writer.writeAll(self.info.name);
+            try writer.writeAll(" gauge\n");
+
+            // Write samples
+            if (use_single_sample) {
+                try writer.writeAll(self.info.name);
+                try writer.writeAll(" ");
+                try writeValue(V, writer, self.sample.get());
+                try writer.writeAll("\n");
+            } else {
+                var it = self.samples.iterator();
+                while (it.next()) |entry| {
+                    try writer.writeAll(self.info.name);
+                    if (entry.key_ptr.len > 0) {
+                        try writer.writeAll("{");
+                        try writer.writeAll(entry.key_ptr.*);
+                        try writer.writeAll("}");
+                    }
+                    try writer.writeAll(" ");
+                    try writeValue(V, writer, entry.value_ptr.*.get());
+                    try writer.writeAll("\n");
+                }
+            }
+        }
     };
 }
 
-test "Gauge(NoLabels): init" {
-    var gauge = try Gauge(NoLabels, .{}).init(
+// ============================================================================
+// Tests with f64 (original behavior)
+// ============================================================================
+
+test "Gauge(f64, NoLabels): init" {
+    var gauge = try Gauge(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_gauge",
         "A test gauge",
@@ -336,8 +557,8 @@ test "Gauge(NoLabels): init" {
     try std.testing.expectEqual(0.0, try gauge.get(.{}));
 }
 
-test "Gauge(NoLabels): inc and dec" {
-    var gauge = try Gauge(NoLabels, .{}).init(
+test "Gauge(f64, NoLabels): inc and dec" {
+    var gauge = try Gauge(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_gauge",
         "Test",
@@ -351,8 +572,8 @@ test "Gauge(NoLabels): inc and dec" {
     try std.testing.expectEqual(0.0, try gauge.get(.{}));
 }
 
-test "Gauge(NoLabels): set" {
-    var gauge = try Gauge(NoLabels, .{}).init(
+test "Gauge(f64, NoLabels): set" {
+    var gauge = try Gauge(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_gauge",
         "Test",
@@ -363,13 +584,13 @@ test "Gauge(NoLabels): set" {
     try std.testing.expectEqual(42.0, try gauge.get(.{}));
 }
 
-test "Gauge with struct labels" {
+test "Gauge(f64) with struct labels" {
     const Labels = struct {
         host: []const u8,
         region: []const u8,
     };
 
-    var gauge = try Gauge(Labels, .{}).init(
+    var gauge = try Gauge(f64, Labels, .{}).init(
         std.testing.allocator,
         "memory_usage_bytes",
         "Memory usage in bytes",
@@ -386,10 +607,8 @@ test "Gauge with struct labels" {
     try std.testing.expectEqual(1536.0, try gauge.get(.{ .host = "server1", .region = "us-east" }));
 }
 
-test "Gauge with RuntimeLabels" {
-    // RuntimeLabels already imported at top of file
-
-    var gauge = try Gauge(RuntimeLabels, .{}).init(
+test "Gauge(f64) with RuntimeLabels" {
+    var gauge = try Gauge(f64, RuntimeLabels, .{}).init(
         std.testing.allocator,
         "temperature_celsius",
         "Temperature in Celsius",
@@ -408,4 +627,152 @@ test "Gauge with RuntimeLabels" {
 
     try std.testing.expectEqual(22.5, try gauge.get(labels1));
     try std.testing.expectEqual(15.0, try gauge.get(labels2));
+}
+
+// ============================================================================
+// Tests with integer types
+// ============================================================================
+
+test "Gauge(i64, NoLabels): init and basic operations" {
+    var gauge = try Gauge(i64, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_gauge",
+        "A test gauge",
+    );
+    defer gauge.deinit();
+
+    try std.testing.expectEqual(0, try gauge.get(.{}));
+
+    try gauge.inc(.{});
+    try std.testing.expectEqual(1, try gauge.get(.{}));
+
+    try gauge.dec(.{});
+    try std.testing.expectEqual(0, try gauge.get(.{}));
+
+    try gauge.add(.{}, -10);
+    try std.testing.expectEqual(-10, try gauge.get(.{}));
+}
+
+test "Gauge(u64, NoLabels): basic operations" {
+    var gauge = try Gauge(u64, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_gauge",
+        "Test",
+    );
+    defer gauge.deinit();
+
+    try gauge.set(.{}, 100);
+    try std.testing.expectEqual(100, try gauge.get(.{}));
+
+    try gauge.add(.{}, 50);
+    try std.testing.expectEqual(150, try gauge.get(.{}));
+}
+
+test "Gauge(i32, NoLabels): signed operations" {
+    var gauge = try Gauge(i32, NoLabels, .{}).init(
+        std.testing.allocator,
+        "test_gauge",
+        "Test",
+    );
+    defer gauge.deinit();
+
+    try gauge.set(.{}, -50);
+    try std.testing.expectEqual(-50, try gauge.get(.{}));
+
+    try gauge.add(.{}, 100);
+    try std.testing.expectEqual(50, try gauge.get(.{}));
+}
+
+test "Gauge(i64) with struct labels" {
+    const Labels = struct {
+        host: []const u8,
+    };
+
+    var gauge = try Gauge(i64, Labels, .{}).init(
+        std.testing.allocator,
+        "connections",
+        "Active connections",
+    );
+    defer gauge.deinit();
+
+    try gauge.set(.{ .host = "server1" }, 10);
+    try gauge.set(.{ .host = "server2" }, 20);
+
+    try std.testing.expectEqual(10, try gauge.get(.{ .host = "server1" }));
+    try std.testing.expectEqual(20, try gauge.get(.{ .host = "server2" }));
+
+    try gauge.dec(.{ .host = "server1" });
+    try std.testing.expectEqual(9, try gauge.get(.{ .host = "server1" }));
+}
+
+// ============================================================================
+// Thread-safe tests
+// ============================================================================
+
+test "Gauge(i64, NoLabels, thread_safe): basic operations" {
+    var gauge = try Gauge(i64, NoLabels, .{ .thread_safe = true }).init(
+        std.testing.allocator,
+        "test_gauge",
+        "Test",
+    );
+    defer gauge.deinit();
+
+    try gauge.inc(.{});
+    try gauge.add(.{}, 10);
+    try std.testing.expectEqual(11, try gauge.get(.{}));
+
+    try gauge.sub(.{}, 5);
+    try std.testing.expectEqual(6, try gauge.get(.{}));
+}
+
+test "Gauge(f64, NoLabels, thread_safe): basic operations" {
+    var gauge = try Gauge(f64, NoLabels, .{ .thread_safe = true }).init(
+        std.testing.allocator,
+        "test_gauge",
+        "Test",
+    );
+    defer gauge.deinit();
+
+    try gauge.set(.{}, 42.5);
+    try std.testing.expectEqual(42.5, try gauge.get(.{}));
+
+    try gauge.add(.{}, 2.5);
+    try std.testing.expectEqual(45.0, try gauge.get(.{}));
+}
+
+// ============================================================================
+// Noop tests
+// ============================================================================
+
+test "Gauge noop: operations are no-ops" {
+    var gauge: Gauge(f64, NoLabels, .{}) = .noop;
+
+    // All operations should succeed silently
+    try gauge.inc(.{});
+    try gauge.dec(.{});
+    try gauge.add(.{}, 5.0);
+    try gauge.sub(.{}, 2.0);
+    try gauge.set(.{}, 100.0);
+    gauge.deinit();
+
+    // Get returns zero
+    try std.testing.expectEqual(0.0, try gauge.get(.{}));
+}
+
+test "Gauge noop: handles work" {
+    var gauge: Gauge(i64, NoLabels, .{}) = .noop;
+
+    const handle = try gauge.register(.{});
+    try gauge.incByHandle(handle);
+    try gauge.decByHandle(handle);
+    try gauge.addByHandle(handle, 10);
+    try gauge.subByHandle(handle, 5);
+    try gauge.setByHandle(handle, 100);
+
+    try std.testing.expectEqual(0, try gauge.getByHandle(handle));
+}
+
+test "Gauge noop: getInfo returns null" {
+    const gauge: Gauge(f64, NoLabels, .{}) = .noop;
+    try std.testing.expect(gauge.getInfo() == null);
 }

@@ -90,21 +90,44 @@ pub const MetricCollector = struct {
     }
 
     /// Register a metric with this collector
+    /// Supports both union-wrapped metrics (with noop/impl) and direct metrics
     pub fn registerMetric(self: *MetricCollector, metric: anytype) !void {
         const MetricType = @TypeOf(metric.*);
+        const type_info = @typeInfo(MetricType);
 
-        // If we have a namespace, prepend it to the metric name
-        if (self.name.len > 0) {
-            const original_name = metric.info.name;
-            const namespaced_name = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}_{s}",
-                .{ self.name, original_name },
-            );
-            // Track the allocated name so we can free it later
-            try self.allocated_names.append(self.allocator, namespaced_name);
-            // Replace the metric's name with the namespaced version
-            metric.info.name = namespaced_name;
+        // Handle union types (new noop-capable metrics)
+        if (type_info == .@"union") {
+            // Check if this is a noop metric - skip it
+            switch (metric.*) {
+                .noop => return, // Don't register noop metrics
+                .impl => |*impl| {
+                    // If we have a namespace, prepend it to the metric name
+                    if (self.name.len > 0) {
+                        const original_name = impl.info.name;
+                        const namespaced_name = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}_{s}",
+                            .{ self.name, original_name },
+                        );
+                        // Track the allocated name so we can free it later
+                        try self.allocated_names.append(self.allocator, namespaced_name);
+                        // Replace the metric's name with the namespaced version
+                        impl.info.name = namespaced_name;
+                    }
+                },
+            }
+        } else {
+            // Handle non-union types (legacy metrics)
+            if (self.name.len > 0) {
+                const original_name = metric.info.name;
+                const namespaced_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}_{s}",
+                    .{ self.name, original_name },
+                );
+                try self.allocated_names.append(self.allocator, namespaced_name);
+                metric.info.name = namespaced_name;
+            }
         }
 
         // Store pointer to metric

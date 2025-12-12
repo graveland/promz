@@ -99,7 +99,7 @@ test "Registry: gatherToString" {
 
     var collector = try MetricCollector.init(std.testing.allocator, "test");
 
-    var counter = try Counter(NoLabels, .{}).init(
+    var counter = try Counter(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_counter",
         "A test counter",
@@ -122,7 +122,6 @@ test "Registry: gatherToString with labeled metrics" {
     const Histogram = @import("../core/histogram.zig").Histogram;
     const Gauge = @import("../core/gauge.zig").Gauge;
     const NoLabels = @import("../core/labels.zig").NoLabels;
-    const BucketConfig = @import("../core/histogram.zig").BucketConfig;
     const MetricCollector = @import("collector.zig").MetricCollector;
 
     var registry = Registry.init(std.testing.allocator);
@@ -131,7 +130,7 @@ test "Registry: gatherToString with labeled metrics" {
     var collector = try MetricCollector.init(std.testing.allocator, "app");
 
     // Labeled counter
-    var http_requests = try Counter(struct {
+    var http_requests = try Counter(f64, struct {
         method: []const u8,
         status: []const u8,
     }, .{ .thread_safe = true }).init(
@@ -142,18 +141,19 @@ test "Registry: gatherToString with labeled metrics" {
     defer http_requests.deinit();
 
     // Labeled histogram
-    var http_duration = try Histogram(struct {
+    const defaultBuckets = @import("../core/histogram.zig").defaultBuckets;
+    var http_duration = try Histogram(f64, struct {
         method: []const u8,
     }, .{ .thread_safe = true }).init(
         std.testing.allocator,
         "http_request_duration_seconds",
         "HTTP request duration in seconds",
-        BucketConfig.default(),
+        defaultBuckets(),
     );
     defer http_duration.deinit();
 
     // Simple gauge
-    var active_connections = try Gauge(NoLabels, .{ .thread_safe = true }).init(
+    var active_connections = try Gauge(f64, NoLabels, .{ .thread_safe = true }).init(
         std.testing.allocator,
         "http_active_connections",
         "Number of active HTTP connections",

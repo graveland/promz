@@ -29,7 +29,27 @@ pub fn writeMetric(writer: anytype, metric: anytype) !void {
 }
 
 /// Write a metric in Prometheus text exposition format (takes pointer - avoids shallow copy issues)
+/// Supports both union-wrapped metrics (with noop/impl) and direct metrics
 pub fn writeMetricPtr(writer: anytype, metric: anytype) !void {
+    const T = @TypeOf(metric.*);
+    const type_info = @typeInfo(T);
+
+    // Handle union types (new noop-capable metrics)
+    if (type_info == .@"union") {
+        switch (metric.*) {
+            .noop => return, // Don't write noop metrics
+            .impl => |*impl| {
+                try writeMetricImpl(writer, impl);
+            },
+        }
+    } else {
+        // Handle non-union types (legacy metrics)
+        try writeMetricImpl(writer, metric);
+    }
+}
+
+/// Internal function to write metric implementation
+fn writeMetricImpl(writer: anytype, metric: anytype) !void {
     const info = metric.info;
 
     // Write HELP line
@@ -47,7 +67,6 @@ pub fn writeMetricPtr(writer: anytype, metric: anytype) !void {
     try writer.writeAll("\n");
 
     // Write samples - use comptime check to avoid type errors
-    // For pointers, we need to check the child type
     const T = @TypeOf(metric.*);
     if (@hasField(T, "buckets")) {
         try writeHistogramSamplesPtr(writer, metric);

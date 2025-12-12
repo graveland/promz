@@ -8,67 +8,89 @@ const RuntimeLabels = @import("labels.zig").RuntimeLabels;
 const generateLabelKey = @import("labels.zig").generateLabelKey;
 const generateLabelKeyBuf = @import("labels.zig").generateLabelKeyBuf;
 const hashStructLabels = @import("labels.zig").hashStructLabels;
+const writeValue = @import("format.zig").writeValue;
 
 /// Default histogram buckets recommended by Prometheus
 /// Covers: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 pub const DEFAULT_BUCKETS = [_]f64{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 };
 
 /// Configuration for histogram buckets
-pub const BucketConfig = struct {
-    upper_bounds: []const f64,
+/// Generic over V - the value type for bucket boundaries
+pub fn BucketConfig(comptime V: type) type {
+    return struct {
+        const Self = @This();
 
-    /// Create buckets with custom upper bounds
-    /// Note: +Inf bucket is added automatically
-    pub fn custom(bounds: []const f64) BucketConfig {
-        return .{ .upper_bounds = bounds };
-    }
+        upper_bounds: []const V,
+        owned: bool,
 
-    /// Create linearly spaced buckets
-    /// start: first bucket boundary
-    /// width: distance between buckets
-    /// count: number of buckets to create
-    pub fn linear(allocator: std.mem.Allocator, start: f64, width: f64, count: usize) !BucketConfig {
-        const bounds = try allocator.alloc(f64, count);
-        for (bounds, 0..) |*bound, i| {
-            bound.* = start + width * @as(f64, @floatFromInt(i));
+        /// Create buckets with custom upper bounds (caller-owned, not freed by deinit)
+        /// Note: +Inf bucket is added automatically
+        pub fn custom(bounds: []const V) Self {
+            return .{ .upper_bounds = bounds, .owned = false };
         }
-        return .{ .upper_bounds = bounds };
-    }
 
-    /// Create exponentially spaced buckets
-    /// start: first bucket boundary
-    /// factor: multiplication factor between buckets
-    /// count: number of buckets to create
-    pub fn exponential(allocator: std.mem.Allocator, start: f64, factor: f64, count: usize) !BucketConfig {
-        const bounds = try allocator.alloc(f64, count);
-        var current = start;
-        for (bounds) |*bound| {
-            bound.* = current;
-            current *= factor;
+        /// Create linearly spaced buckets (allocator-owned, freed by deinit)
+        /// start: first bucket boundary
+        /// width: distance between buckets
+        /// count: number of buckets to create
+        pub fn linear(allocator: std.mem.Allocator, start: V, width: V, count: usize) !Self {
+            const bounds = try allocator.alloc(V, count);
+            const is_integer = @typeInfo(V) == .int;
+            for (bounds, 0..) |*bound, i| {
+                const idx: V = if (is_integer) @intCast(i) else @floatFromInt(i);
+                bound.* = start + width * idx;
+            }
+            return .{ .upper_bounds = bounds, .owned = true };
         }
-        return .{ .upper_bounds = bounds };
-    }
 
-    /// Use default Prometheus buckets
-    pub fn default() BucketConfig {
-        return .{ .upper_bounds = &DEFAULT_BUCKETS };
-    }
+        /// Create exponentially spaced buckets (allocator-owned, freed by deinit)
+        /// start: first bucket boundary
+        /// factor: multiplication factor between buckets
+        /// count: number of buckets to create
+        pub fn exponential(allocator: std.mem.Allocator, start: V, factor: V, count: usize) !Self {
+            const bounds = try allocator.alloc(V, count);
+            var current = start;
+            for (bounds) |*bound| {
+                bound.* = current;
+                current *= factor;
+            }
+            return .{ .upper_bounds = bounds, .owned = true };
+        }
 
-    /// Free allocated bucket memory (only for linear/exponential)
-    pub fn deinit(self: BucketConfig, allocator: std.mem.Allocator) void {
-        // Only free if this was allocated (not default or custom static)
-        // User must track this themselves for now
-        _ = self;
-        _ = allocator;
+        /// Free allocated bucket memory (only needed for linear/exponential)
+        pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+            if (self.owned) {
+                allocator.free(@constCast(self.upper_bounds));
+            }
+        }
+    };
+}
+
+/// Default bucket config (f64)
+pub fn defaultBuckets() BucketConfig(f64) {
+    return BucketConfig(f64).custom(&DEFAULT_BUCKETS);
+}
+
+/// Validate that V is a valid histogram type
+fn assertHistogramType(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .float => return,
+        .int => return,
+        else => {},
     }
-};
+    @compileError("Histogram metric must be an integer or a float, got: " ++ @typeName(T));
+}
 
 /// A single histogram observation tracking buckets, sum, and count
-fn HistogramSampleType(comptime thread_safe: bool) type {
+fn HistogramSampleType(comptime V: type, comptime thread_safe: bool) type {
+    assertHistogramType(V);
+    const is_integer = @typeInfo(V) == .int;
+    const zero: V = if (is_integer) 0 else 0.0;
+
     return struct {
-        bucket_counts: []u64,  // Cumulative counts for each bucket (including +Inf)
-        sum: f64,              // Sum of all observed values
-        count: u64,            // Total number of observations
+        bucket_counts: []u64, // Cumulative counts for each bucket (including +Inf)
+        sum: V, // Sum of all observed values
+        count: u64, // Total number of observations
         allocator: std.mem.Allocator,
         mutex: if (thread_safe) std.Thread.Mutex else void,
 
@@ -81,7 +103,7 @@ fn HistogramSampleType(comptime thread_safe: bool) type {
 
             return Self{
                 .bucket_counts = bucket_counts,
-                .sum = 0.0,
+                .sum = zero,
                 .count = 0,
                 .allocator = allocator,
                 .mutex = if (thread_safe) std.Thread.Mutex{} else {},
@@ -92,7 +114,17 @@ fn HistogramSampleType(comptime thread_safe: bool) type {
             self.allocator.free(self.bucket_counts);
         }
 
-        fn observe(self: *Self, value: f64, upper_bounds: []const f64) void {
+        fn reset(self: *Self) void {
+            if (thread_safe) {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+            }
+            @memset(self.bucket_counts, 0);
+            self.sum = zero;
+            self.count = 0;
+        }
+
+        fn observe(self: *Self, value: V, upper_bounds: []const V) void {
             if (thread_safe) {
                 self.mutex.lock();
                 defer self.mutex.unlock();
@@ -127,8 +159,151 @@ pub const HistogramConfig = struct {
 
 /// Histogram - records observations in configurable buckets
 /// Useful for measuring distributions (latency, request sizes, etc.)
-pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type {
-    const HistogramSample = HistogramSampleType(config.thread_safe);
+/// Generic over:
+/// - V: the value type (f32, f64, u32, u64, etc.)
+/// - TLabels: the label type for compile-time type safety
+/// - config: configuration options
+///
+/// This is a union type that supports noop mode for zero-cost disabled metrics.
+/// Use `.noop` for disabled metrics or call `init()` for active metrics.
+pub fn Histogram(comptime V: type, comptime TLabels: type, comptime config: HistogramConfig) type {
+    assertHistogramType(V);
+
+    return union(enum) {
+        const Self = @This();
+        pub const Labels = TLabels;
+        pub const ValueType = V;
+
+        noop: void,
+        impl: Impl,
+
+        /// Initialize an active histogram with the given name, help text, and bucket configuration
+        pub fn init(
+            allocator: std.mem.Allocator,
+            name: []const u8,
+            help: []const u8,
+            buckets: BucketConfig(V),
+        ) !Self {
+            return .{ .impl = try Impl.init(allocator, name, help, buckets) };
+        }
+
+        /// Clean up resources
+        pub fn deinit(self: *Self) void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| impl.deinit(),
+            }
+        }
+
+        /// Observe a value and update the histogram
+        pub fn observe(self: *Self, labels: TLabels, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.observe(labels, value),
+            }
+        }
+
+        /// Pre-register a label combination for O(1) access
+        pub fn register(self: *Self, labels: TLabels) !LabelHandle {
+            switch (self.*) {
+                .noop => return LabelHandle{ .index = 0, .generation = 0 },
+                .impl => |*impl| return impl.register(labels),
+            }
+        }
+
+        /// Observe using a pre-registered handle
+        pub fn observeByHandle(self: *Self, handle: LabelHandle, value: V) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.observeByHandle(handle, value),
+            }
+        }
+
+        /// Get bucket count for a specific bucket index
+        pub fn getBucketCount(self: *const Self, labels: TLabels, bucket_index: usize) !u64 {
+            switch (self.*) {
+                .noop => return 0,
+                .impl => |*impl| return impl.getBucketCount(labels, bucket_index),
+            }
+        }
+
+        /// Get the sum of all observed values
+        pub fn getSum(self: *const Self, labels: TLabels) !V {
+            const is_integer = @typeInfo(V) == .int;
+            const zero: V = if (is_integer) 0 else 0.0;
+            switch (self.*) {
+                .noop => return zero,
+                .impl => |*impl| return impl.getSum(labels),
+            }
+        }
+
+        /// Get the total count of observations
+        pub fn getCount(self: *const Self, labels: TLabels) !u64 {
+            switch (self.*) {
+                .noop => return 0,
+                .impl => |*impl| return impl.getCount(labels),
+            }
+        }
+
+        /// Get bucket count using a pre-registered handle
+        pub fn getBucketCountByHandle(self: *const Self, handle: LabelHandle, bucket_index: usize) !u64 {
+            switch (self.*) {
+                .noop => return 0,
+                .impl => |*impl| return impl.getBucketCountByHandle(handle, bucket_index),
+            }
+        }
+
+        /// Get sum using a pre-registered handle
+        pub fn getSumByHandle(self: *const Self, handle: LabelHandle) !V {
+            const is_integer = @typeInfo(V) == .int;
+            const zero: V = if (is_integer) 0 else 0.0;
+            switch (self.*) {
+                .noop => return zero,
+                .impl => |*impl| return impl.getSumByHandle(handle),
+            }
+        }
+
+        /// Get count using a pre-registered handle
+        pub fn getCountByHandle(self: *const Self, handle: LabelHandle) !u64 {
+            switch (self.*) {
+                .noop => return 0,
+                .impl => |*impl| return impl.getCountByHandle(handle),
+            }
+        }
+
+        /// Reset all histogram data (for testing)
+        pub fn reset(self: *Self) void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| impl.reset(),
+            }
+        }
+
+        /// Get metric info (returns null for noop)
+        pub fn getInfo(self: *const Self) ?MetricInfo {
+            switch (self.*) {
+                .noop => return null,
+                .impl => |*impl| return impl.info,
+            }
+        }
+
+        /// Write the metric in Prometheus text exposition format to any writer
+        /// This allows metrics to write themselves directly without a registry
+        pub fn write(self: *const Self, writer: anytype) !void {
+            switch (self.*) {
+                .noop => {},
+                .impl => |*impl| try impl.write(writer),
+            }
+        }
+
+        /// The implementation type (for advanced usage)
+        pub const Impl = HistogramImpl(V, TLabels, config);
+    };
+}
+
+/// Internal implementation of Histogram (extracted for union wrapper)
+fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: HistogramConfig) type {
+    const HistogramSample = HistogramSampleType(V, config.thread_safe);
     const use_single_sample = (TLabels == NoLabels);
     const use_comptime_hash = !use_single_sample and (TLabels != RuntimeLabels);
 
@@ -138,6 +313,7 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
         // This ensures cached pointers remain valid even when HashMap resizes
         const SampleMap = std.StringHashMap(*HistogramSample);
         pub const Labels = TLabels;
+        pub const ValueType = V;
 
         // Thread-local cache constants
         const CACHE_SIZE = config.cache_size;
@@ -149,7 +325,7 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
 
         allocator: std.mem.Allocator,
         info: MetricInfo,
-        buckets: BucketConfig,
+        buckets: BucketConfig(V),
         sample: if (use_single_sample) HistogramSample else void,
         samples: if (use_single_sample) void else SampleMap,
         samples_array: if (use_single_sample) void else std.ArrayListUnmanaged(*HistogramSample),
@@ -163,7 +339,7 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
             allocator: std.mem.Allocator,
             name: []const u8,
             help: []const u8,
-            buckets: BucketConfig,
+            buckets: BucketConfig(V),
         ) !Self {
             const info = MetricInfo{
                 .name = name,
@@ -219,7 +395,7 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
         }
 
         /// Observe a value and update the histogram
-        pub fn observe(self: *Self, labels: TLabels, value: f64) !void {
+        pub fn observe(self: *Self, labels: TLabels, value: V) !void {
             if (use_single_sample) {
                 self.sample.observe(value, self.buckets.upper_bounds);
             } else {
@@ -242,7 +418,7 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
         }
 
         /// Observe using a pre-registered handle
-        pub fn observeByHandle(self: *Self, handle: LabelHandle, value: f64) !void {
+        pub fn observeByHandle(self: *Self, handle: LabelHandle, value: V) !void {
             if (use_single_sample) {
                 try self.validateHandle(handle);
                 self.sample.observe(value, self.buckets.upper_bounds);
@@ -265,7 +441,7 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
         pub fn getBucketCount(self: *const Self, labels: TLabels, bucket_index: usize) !u64 {
             if (use_single_sample) {
                 if (bucket_index >= self.sample.bucket_counts.len) {
-                    return MetricError.SampleNotFound;
+                    return MetricError.InvalidHandle;
                 }
                 return self.sample.bucket_counts[bucket_index];
             } else {
@@ -273,14 +449,14 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
                 const key = try generateLabelKeyBuf(&key_buf, TLabels, labels);
                 const sample_ptr = self.samples.get(key) orelse return MetricError.SampleNotFound;
                 if (bucket_index >= sample_ptr.bucket_counts.len) {
-                    return MetricError.SampleNotFound;
+                    return MetricError.InvalidHandle;
                 }
                 return sample_ptr.bucket_counts[bucket_index];
             }
         }
 
         /// Get the sum of all observed values
-        pub fn getSum(self: *const Self, labels: TLabels) !f64 {
+        pub fn getSum(self: *const Self, labels: TLabels) !V {
             if (use_single_sample) {
                 return self.sample.sum;
             } else {
@@ -301,6 +477,56 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
                 const sample_ptr = self.samples.get(key) orelse return MetricError.SampleNotFound;
                 return sample_ptr.count;
             }
+        }
+
+        /// Get bucket count using a pre-registered handle
+        pub fn getBucketCountByHandle(self: *const Self, handle: LabelHandle, bucket_index: usize) !u64 {
+            try self.validateHandle(handle);
+            if (use_single_sample) {
+                if (bucket_index >= self.sample.bucket_counts.len) {
+                    return MetricError.InvalidHandle;
+                }
+                return self.sample.bucket_counts[bucket_index];
+            } else {
+                const sample = self.samples_array.items[handle.index];
+                if (bucket_index >= sample.bucket_counts.len) {
+                    return MetricError.InvalidHandle;
+                }
+                return sample.bucket_counts[bucket_index];
+            }
+        }
+
+        /// Get sum using a pre-registered handle
+        pub fn getSumByHandle(self: *const Self, handle: LabelHandle) !V {
+            try self.validateHandle(handle);
+            if (use_single_sample) {
+                return self.sample.sum;
+            } else {
+                return self.samples_array.items[handle.index].sum;
+            }
+        }
+
+        /// Get count using a pre-registered handle
+        pub fn getCountByHandle(self: *const Self, handle: LabelHandle) !u64 {
+            try self.validateHandle(handle);
+            if (use_single_sample) {
+                return self.sample.count;
+            } else {
+                return self.samples_array.items[handle.index].count;
+            }
+        }
+
+        /// Reset all histogram data (for testing)
+        pub fn reset(self: *Self) void {
+            if (use_single_sample) {
+                self.sample.reset();
+            } else {
+                var it = self.samples.valueIterator();
+                while (it.next()) |sample_ptr| {
+                    sample_ptr.*.reset();
+                }
+            }
+            self.generation +%= 1;
         }
 
         /// Get or create a sample for the given labels (internal)
@@ -375,19 +601,106 @@ pub fn Histogram(comptime TLabels: type, comptime config: HistogramConfig) type 
             };
             tl_lru_tick +%= 1;
         }
+
+        /// Write the metric in Prometheus text exposition format to any writer
+        pub fn write(self: *const Self, writer: anytype) !void {
+            // Write HELP line
+            try writer.writeAll("# HELP ");
+            try writer.writeAll(self.info.name);
+            try writer.writeAll(" ");
+            try writer.writeAll(self.info.help);
+            try writer.writeAll("\n");
+
+            // Write TYPE line
+            try writer.writeAll("# TYPE ");
+            try writer.writeAll(self.info.name);
+            try writer.writeAll(" histogram\n");
+
+            // Write samples
+            if (use_single_sample) {
+                try writeHistogramSampleData(V, writer, self.info.name, "", &self.sample, self.buckets.upper_bounds);
+            } else {
+                var it = self.samples.iterator();
+                while (it.next()) |entry| {
+                    try writeHistogramSampleData(V, writer, self.info.name, entry.key_ptr.*, entry.value_ptr.*, self.buckets.upper_bounds);
+                }
+            }
+        }
     };
 }
 
-test "BucketConfig: default buckets" {
-    const buckets = BucketConfig.default();
+/// Helper to write histogram sample data (buckets, sum, count)
+fn writeHistogramSampleData(comptime V: type, writer: anytype, name: []const u8, label_str: []const u8, sample: anytype, upper_bounds: []const V) !void {
+    var buf: [64]u8 = undefined;
+
+    // Write bucket samples
+    for (upper_bounds, 0..) |bound, i| {
+        try writer.writeAll(name);
+        try writer.writeAll("_bucket{");
+        if (label_str.len > 0) {
+            try writer.writeAll(label_str);
+            try writer.writeAll(",");
+        }
+        try writer.writeAll("le=\"");
+        try writeValue(V, writer, bound);
+        try writer.writeAll("\"} ");
+        const count_str = try std.fmt.bufPrint(&buf, "{d}", .{sample.bucket_counts[i]});
+        try writer.writeAll(count_str);
+        try writer.writeAll("\n");
+    }
+
+    // Write +Inf bucket
+    try writer.writeAll(name);
+    try writer.writeAll("_bucket{");
+    if (label_str.len > 0) {
+        try writer.writeAll(label_str);
+        try writer.writeAll(",");
+    }
+    try writer.writeAll("le=\"+Inf\"} ");
+    const inf_count_str = try std.fmt.bufPrint(&buf, "{d}", .{sample.bucket_counts[upper_bounds.len]});
+    try writer.writeAll(inf_count_str);
+    try writer.writeAll("\n");
+
+    // Write sum
+    try writer.writeAll(name);
+    try writer.writeAll("_sum");
+    if (label_str.len > 0) {
+        try writer.writeAll("{");
+        try writer.writeAll(label_str);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll(" ");
+    try writeValue(V, writer, sample.sum);
+    try writer.writeAll("\n");
+
+    // Write count
+    try writer.writeAll(name);
+    try writer.writeAll("_count");
+    if (label_str.len > 0) {
+        try writer.writeAll("{");
+        try writer.writeAll(label_str);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll(" ");
+    const count_str2 = try std.fmt.bufPrint(&buf, "{d}", .{sample.count});
+    try writer.writeAll(count_str2);
+    try writer.writeAll("\n");
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "BucketConfig(f64): default buckets" {
+    const buckets = defaultBuckets();
     try std.testing.expectEqual(11, buckets.upper_bounds.len);
     try std.testing.expectEqual(0.005, buckets.upper_bounds[0]);
     try std.testing.expectEqual(10.0, buckets.upper_bounds[10]);
 }
 
-test "BucketConfig: linear buckets" {
-    const buckets = try BucketConfig.linear(std.testing.allocator, 5.0, 5.0, 3);
-    defer std.testing.allocator.free(buckets.upper_bounds);
+test "BucketConfig(f64): linear buckets" {
+    const buckets = try BucketConfig(f64).linear(std.testing.allocator, 5.0, 5.0, 3);
+    defer buckets.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(3, buckets.upper_bounds.len);
     try std.testing.expectEqual(5.0, buckets.upper_bounds[0]);
@@ -395,9 +708,9 @@ test "BucketConfig: linear buckets" {
     try std.testing.expectEqual(15.0, buckets.upper_bounds[2]);
 }
 
-test "BucketConfig: exponential buckets" {
-    const buckets = try BucketConfig.exponential(std.testing.allocator, 1.0, 2.0, 4);
-    defer std.testing.allocator.free(buckets.upper_bounds);
+test "BucketConfig(f64): exponential buckets" {
+    const buckets = try BucketConfig(f64).exponential(std.testing.allocator, 1.0, 2.0, 4);
+    defer buckets.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(4, buckets.upper_bounds.len);
     try std.testing.expectEqual(1.0, buckets.upper_bounds[0]);
@@ -406,9 +719,9 @@ test "BucketConfig: exponential buckets" {
     try std.testing.expectEqual(8.0, buckets.upper_bounds[3]);
 }
 
-test "Histogram(NoLabels): basic observation" {
-    const buckets = BucketConfig.custom(&[_]f64{ 1.0, 5.0, 10.0 });
-    var hist = try Histogram(NoLabels, .{}).init(
+test "Histogram(f64, NoLabels): basic observation" {
+    const buckets = BucketConfig(f64).custom(&[_]f64{ 1.0, 5.0, 10.0 });
+    var hist = try Histogram(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "test_histogram",
         "Test histogram",
@@ -432,18 +745,18 @@ test "Histogram(NoLabels): basic observation" {
     try std.testing.expectEqual(4, try hist.getCount(.{}));
 }
 
-test "Histogram(NoLabels): default buckets" {
-    var hist = try Histogram(NoLabels, .{}).init(
+test "Histogram(f64, NoLabels): default buckets" {
+    var hist = try Histogram(f64, NoLabels, .{}).init(
         std.testing.allocator,
         "latency_seconds",
         "Request latency in seconds",
-        BucketConfig.default(),
+        defaultBuckets(),
     );
     defer hist.deinit();
 
     try hist.observe(.{}, 0.003); // < 5ms
     try hist.observe(.{}, 0.015); // Between 10-25ms
-    try hist.observe(.{}, 0.5);   // 500ms
+    try hist.observe(.{}, 0.5); // 500ms
 
     try std.testing.expectEqual(1, try hist.getBucketCount(.{}, 0)); // <= 0.005
     try std.testing.expectEqual(1, try hist.getBucketCount(.{}, 1)); // <= 0.01
@@ -451,14 +764,14 @@ test "Histogram(NoLabels): default buckets" {
     try std.testing.expectEqual(3, try hist.getCount(.{}));
 }
 
-test "Histogram with struct labels" {
+test "Histogram(f64) with struct labels" {
     const Labels = struct {
         method: []const u8,
         status: []const u8,
     };
 
-    const buckets = BucketConfig.custom(&[_]f64{ 0.1, 0.5, 1.0 });
-    var hist = try Histogram(Labels, .{}).init(
+    const buckets = BucketConfig(f64).custom(&[_]f64{ 0.1, 0.5, 1.0 });
+    var hist = try Histogram(f64, Labels, .{}).init(
         std.testing.allocator,
         "http_request_duration_seconds",
         "HTTP request duration",
@@ -477,11 +790,9 @@ test "Histogram with struct labels" {
     try std.testing.expectEqual(1, try hist.getCount(.{ .method = "POST", .status = "201" }));
 }
 
-test "Histogram with RuntimeLabels" {
-    // RuntimeLabels already imported at top of file
-
-    const buckets = BucketConfig.custom(&[_]f64{ 10.0, 50.0, 100.0 });
-    var hist = try Histogram(RuntimeLabels, .{}).init(
+test "Histogram(f64) with RuntimeLabels" {
+    const buckets = BucketConfig(f64).custom(&[_]f64{ 10.0, 50.0, 100.0 });
+    var hist = try Histogram(f64, RuntimeLabels, .{}).init(
         std.testing.allocator,
         "response_size_bytes",
         "Response size in bytes",
@@ -503,4 +814,100 @@ test "Histogram with RuntimeLabels" {
     try std.testing.expectEqual(2, try hist.getCount(api_labels));
     try std.testing.expectEqual(1, try hist.getCount(web_labels));
     try std.testing.expectEqual(30.0, try hist.getSum(api_labels));
+}
+
+// ============================================================================
+// Integer histogram tests
+// ============================================================================
+
+test "Histogram(u64, NoLabels): basic observation" {
+    const buckets = BucketConfig(u64).custom(&[_]u64{ 100, 500, 1000 });
+    var hist = try Histogram(u64, NoLabels, .{}).init(
+        std.testing.allocator,
+        "response_bytes",
+        "Response size in bytes",
+        buckets,
+    );
+    defer hist.deinit();
+
+    try hist.observe(.{}, 50);
+    try hist.observe(.{}, 300);
+    try hist.observe(.{}, 700);
+    try hist.observe(.{}, 1500);
+
+    // Check bucket counts (cumulative)
+    try std.testing.expectEqual(1, try hist.getBucketCount(.{}, 0)); // <= 100
+    try std.testing.expectEqual(2, try hist.getBucketCount(.{}, 1)); // <= 500
+    try std.testing.expectEqual(3, try hist.getBucketCount(.{}, 2)); // <= 1000
+    try std.testing.expectEqual(4, try hist.getBucketCount(.{}, 3)); // +Inf
+
+    // Check sum and count
+    try std.testing.expectEqual(2550, try hist.getSum(.{}));
+    try std.testing.expectEqual(4, try hist.getCount(.{}));
+}
+
+test "BucketConfig(u64): linear buckets" {
+    const buckets = try BucketConfig(u64).linear(std.testing.allocator, 100, 100, 3);
+    defer buckets.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(3, buckets.upper_bounds.len);
+    try std.testing.expectEqual(100, buckets.upper_bounds[0]);
+    try std.testing.expectEqual(200, buckets.upper_bounds[1]);
+    try std.testing.expectEqual(300, buckets.upper_bounds[2]);
+}
+
+// ============================================================================
+// Thread-safe tests
+// ============================================================================
+
+test "Histogram(f64, NoLabels, thread_safe): basic observation" {
+    const buckets = BucketConfig(f64).custom(&[_]f64{ 1.0, 5.0, 10.0 });
+    var hist = try Histogram(f64, NoLabels, .{ .thread_safe = true }).init(
+        std.testing.allocator,
+        "test_histogram",
+        "Test histogram",
+        buckets,
+    );
+    defer hist.deinit();
+
+    try hist.observe(.{}, 0.5);
+    try hist.observe(.{}, 3.0);
+    try hist.observe(.{}, 7.0);
+
+    try std.testing.expectEqual(10.5, try hist.getSum(.{}));
+    try std.testing.expectEqual(3, try hist.getCount(.{}));
+}
+
+// ============================================================================
+// Noop tests
+// ============================================================================
+
+test "Histogram noop: operations are no-ops" {
+    var hist: Histogram(f64, NoLabels, .{}) = .noop;
+
+    // All operations should succeed silently
+    try hist.observe(.{}, 0.5);
+    try hist.observe(.{}, 3.0);
+    hist.deinit();
+
+    // Getters return zero
+    try std.testing.expectEqual(0.0, try hist.getSum(.{}));
+    try std.testing.expectEqual(0, try hist.getCount(.{}));
+    try std.testing.expectEqual(0, try hist.getBucketCount(.{}, 0));
+}
+
+test "Histogram noop: handles work" {
+    var hist: Histogram(u64, NoLabels, .{}) = .noop;
+
+    const handle = try hist.register(.{});
+    try hist.observeByHandle(handle, 100);
+    try hist.observeByHandle(handle, 200);
+
+    try std.testing.expectEqual(0, try hist.getSum(.{}));
+    try std.testing.expectEqual(0, try hist.getCount(.{}));
+}
+
+test "Histogram noop: getInfo returns null" {
+    const hist: Histogram(f64, NoLabels, .{}) = .noop;
+    try std.testing.expect(hist.getInfo() == null);
 }
