@@ -2,6 +2,9 @@
 // Pure Zig implementation with idiomatic API
 
 const std = @import("std");
+const build_options = @import("build_options");
+
+pub const version = build_options.version;
 
 // Core types and errors
 pub const MetricType = @import("core/metric.zig").MetricType;

@@ -1,5 +1,35 @@
 const std = @import("std");
 
+fn getVersion(b: *std.Build) []const u8 {
+    const src_dir = std.fs.path.dirname(@src().file) orelse ".";
+    var exit_code: u8 = 0;
+    const git_hash = b.runAllowFail(&[_][]const u8{
+        "git", "-C", src_dir, "rev-parse", "HEAD",
+    }, &exit_code, .Inherit) catch return "unknown";
+    return std.mem.trim(u8, git_hash, &std.ascii.whitespace);
+}
+
+/// Creates the promz module with injected dependencies.
+/// Use this when incorporating promz as a dependency to share modules with parent.
+pub fn createModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    root_source_file: std.Build.LazyPath,
+) *std.Build.Module {
+    const mod = b.addModule("promz", .{
+        .root_source_file = root_source_file,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", getVersion(b));
+    mod.addOptions("build_options", options);
+
+    return mod;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -8,6 +38,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", getVersion(b));
+    mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "promz",
