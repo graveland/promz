@@ -83,7 +83,7 @@ fn writeSamples(writer: anytype, metric: anytype) !void {
         // Single sample - no labels
         try writer.writeAll(metric.info.name);
         try writer.writeAll(" ");
-        try writeFloat(writer, metric.sample.get());
+        try writeValue(writer, metric.sample.get());
         try writer.writeAll("\n");
     } else {
         // Multiple samples with labels - value_ptr.* is *SampleType (pointer to heap-allocated sample)
@@ -96,35 +96,41 @@ fn writeSamples(writer: anytype, metric: anytype) !void {
                 try writer.writeAll("}");
             }
             try writer.writeAll(" ");
-            try writeFloat(writer, entry.value_ptr.*.get());
+            try writeValue(writer, entry.value_ptr.*.get());
             try writer.writeAll("\n");
         }
     }
 }
 
 fn writeSamplesPtr(writer: anytype, metric: anytype) !void {
-    const TLabels = @TypeOf(metric.*).Labels;
-    const use_single_sample = (TLabels == @import("../core/labels.zig").NoLabels);
+    const T = @TypeOf(metric.*);
+    const TLabels = T.Labels;
+    const NoLabels = @import("../core/labels.zig").NoLabels;
 
-    if (use_single_sample) {
+    if (TLabels == NoLabels) {
         // Single sample - no labels
         try writer.writeAll(metric.info.name);
         try writer.writeAll(" ");
-        try writeFloat(writer, metric.sample.get());
+        try writeValue(writer, metric.sample.get());
         try writer.writeAll("\n");
     } else {
-        // Multiple samples with labels - value_ptr.* is *SampleType (pointer to heap-allocated sample)
-        var it = metric.samples.iterator();
-        while (it.next()) |entry| {
-            try writer.writeAll(metric.info.name);
-            if (entry.key_ptr.len > 0) {
-                try writer.writeAll("{");
-                try writer.writeAll(entry.key_ptr.*);
-                try writer.writeAll("}");
+        // Multiple samples with labels
+        // Access samples field directly for labeled metrics
+        inline for (@typeInfo(T).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "samples")) {
+                var it = @field(metric.*, "samples").iterator();
+                while (it.next()) |entry| {
+                    try writer.writeAll(metric.info.name);
+                    if (entry.key_ptr.len > 0) {
+                        try writer.writeAll("{");
+                        try writer.writeAll(entry.key_ptr.*);
+                        try writer.writeAll("}");
+                    }
+                    try writer.writeAll(" ");
+                    try writeValue(writer, entry.value_ptr.*.get());
+                    try writer.writeAll("\n");
+                }
             }
-            try writer.writeAll(" ");
-            try writeFloat(writer, entry.value_ptr.*.get());
-            try writer.writeAll("\n");
         }
     }
 }
@@ -145,16 +151,21 @@ fn writeHistogramSamples(writer: anytype, histogram: anytype) !void {
 }
 
 fn writeHistogramSamplesPtr(writer: anytype, histogram: anytype) !void {
-    const TLabels = @TypeOf(histogram.*).Labels;
-    const use_single_sample = (TLabels == @import("../core/labels.zig").NoLabels);
+    const T = @TypeOf(histogram.*);
+    const TLabels = T.Labels;
+    const NoLabels = @import("../core/labels.zig").NoLabels;
 
-    if (use_single_sample) {
+    if (TLabels == NoLabels) {
         try writeHistogramSample(writer, histogram.info.name, "", &histogram.sample, histogram.buckets.upper_bounds);
     } else {
-        // entry.value_ptr.* is *HistogramSample (pointer to heap-allocated sample)
-        var it = histogram.samples.iterator();
-        while (it.next()) |entry| {
-            try writeHistogramSample(writer, histogram.info.name, entry.key_ptr.*, entry.value_ptr.*, histogram.buckets.upper_bounds);
+        // Access samples field directly for labeled metrics
+        inline for (@typeInfo(T).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "samples")) {
+                var it = @field(histogram.*, "samples").iterator();
+                while (it.next()) |entry| {
+                    try writeHistogramSample(writer, histogram.info.name, entry.key_ptr.*, entry.value_ptr.*, histogram.buckets.upper_bounds);
+                }
+            }
         }
     }
 }
@@ -169,7 +180,7 @@ fn writeHistogramSample(writer: anytype, name: []const u8, label_str: []const u8
             try writer.writeAll(",");
         }
         try writer.writeAll("le=\"");
-        try writeFloat(writer, bound);
+        try writeValue(writer, bound);
         try writer.writeAll("\"} ");
         var buf: [32]u8 = undefined;
         const count_str = try std.fmt.bufPrint(&buf, "{d}", .{sample.bucket_counts[i]});
@@ -199,7 +210,7 @@ fn writeHistogramSample(writer: anytype, name: []const u8, label_str: []const u8
         try writer.writeAll("}");
     }
     try writer.writeAll(" ");
-    try writeFloat(writer, sample.sum);
+    try writeValue(writer, sample.sum);
     try writer.writeAll("\n");
 
     // Write count
@@ -217,25 +228,32 @@ fn writeHistogramSample(writer: anytype, name: []const u8, label_str: []const u8
     try writer.writeAll("\n");
 }
 
-fn writeFloat(writer: anytype, value: f64) !void {
-    if (std.math.isNan(value)) {
-        try writer.writeAll("NaN");
-    } else if (std.math.isInf(value)) {
-        if (value > 0) {
-            try writer.writeAll("+Inf");
-        } else {
-            try writer.writeAll("-Inf");
+fn writeValue(writer: anytype, value: anytype) !void {
+    const T = @TypeOf(value);
+    const type_info = @typeInfo(T);
+
+    if (type_info == .float) {
+        // Handle special float values
+        if (std.math.isNan(value)) {
+            try writer.writeAll("NaN");
+            return;
+        } else if (std.math.isInf(value)) {
+            if (value > 0) {
+                try writer.writeAll("+Inf");
+            } else {
+                try writer.writeAll("-Inf");
+            }
+            return;
         }
-    } else {
-        var buf: [128]u8 = undefined;
-        const str = try std.fmt.bufPrint(&buf, "{d}", .{value});
-        try writer.writeAll(str);
     }
+
+    // Format both ints and floats with {d}
+    var buf: [128]u8 = undefined;
+    const str = try std.fmt.bufPrint(&buf, "{d}", .{value});
+    try writer.writeAll(str);
 }
 
-test "writeFloat: normal values" {
-    // Simple test - writeFloat is used internally and tested through full integration tests
-    // Just verify it doesn't crash
+test "writeValue: normal values" {
     const TestWriter = struct {
         written: []const u8 = "",
 
@@ -246,5 +264,7 @@ test "writeFloat: normal values" {
     };
 
     var tw = TestWriter{};
-    try writeFloat(&tw, 42.5);
+    try writeValue(&tw, 42.5);
+    try writeValue(&tw, @as(i64, 42));
+    try writeValue(&tw, @as(u64, 42));
 }
