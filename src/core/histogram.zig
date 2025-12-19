@@ -445,8 +445,18 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
                 }
                 return self.sample.bucket_counts[bucket_index];
             } else {
-                var key_buf: [64]u8 = undefined;
-                const key = try generateLabelKeyBuf(&key_buf, TLabels, labels);
+                var key_buf: [256]u8 = undefined;
+                const key = generateLabelKeyBuf(&key_buf, TLabels, labels) catch |err| switch (err) {
+                    error.NoSpaceLeft => {
+                        const allocated_key = try generateLabelKey(self.allocator, TLabels, labels);
+                        defer self.allocator.free(allocated_key);
+                        const sample_ptr = self.samples.get(allocated_key) orelse return MetricError.SampleNotFound;
+                        if (bucket_index >= sample_ptr.bucket_counts.len) {
+                            return MetricError.InvalidHandle;
+                        }
+                        return sample_ptr.bucket_counts[bucket_index];
+                    },
+                };
                 const sample_ptr = self.samples.get(key) orelse return MetricError.SampleNotFound;
                 if (bucket_index >= sample_ptr.bucket_counts.len) {
                     return MetricError.InvalidHandle;
@@ -460,8 +470,15 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             if (use_single_sample) {
                 return self.sample.sum;
             } else {
-                var key_buf: [64]u8 = undefined;
-                const key = try generateLabelKeyBuf(&key_buf, TLabels, labels);
+                var key_buf: [256]u8 = undefined;
+                const key = generateLabelKeyBuf(&key_buf, TLabels, labels) catch |err| switch (err) {
+                    error.NoSpaceLeft => {
+                        const allocated_key = try generateLabelKey(self.allocator, TLabels, labels);
+                        defer self.allocator.free(allocated_key);
+                        const sample_ptr = self.samples.get(allocated_key) orelse return MetricError.SampleNotFound;
+                        return sample_ptr.sum;
+                    },
+                };
                 const sample_ptr = self.samples.get(key) orelse return MetricError.SampleNotFound;
                 return sample_ptr.sum;
             }
@@ -472,8 +489,15 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             if (use_single_sample) {
                 return self.sample.count;
             } else {
-                var key_buf: [64]u8 = undefined;
-                const key = try generateLabelKeyBuf(&key_buf, TLabels, labels);
+                var key_buf: [256]u8 = undefined;
+                const key = generateLabelKeyBuf(&key_buf, TLabels, labels) catch |err| switch (err) {
+                    error.NoSpaceLeft => {
+                        const allocated_key = try generateLabelKey(self.allocator, TLabels, labels);
+                        defer self.allocator.free(allocated_key);
+                        const sample_ptr = self.samples.get(allocated_key) orelse return MetricError.SampleNotFound;
+                        return sample_ptr.count;
+                    },
+                };
                 const sample_ptr = self.samples.get(key) orelse return MetricError.SampleNotFound;
                 return sample_ptr.count;
             }
@@ -547,8 +571,10 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             }
 
             // Fast path: use stack buffer for lookup (zero allocations)
-            var key_buf: [64]u8 = undefined;
-            const key = try generateLabelKeyBuf(&key_buf, TLabels, labels);
+            var key_buf: [256]u8 = undefined;
+            const key = generateLabelKeyBuf(&key_buf, TLabels, labels) catch |err| switch (err) {
+                error.NoSpaceLeft => return self.getOrCreateSampleAlloc(labels, hash),
+            };
 
             // Check if sample already exists (hot path)
             if (self.samples.get(key)) |sample_ptr| {
@@ -570,6 +596,34 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             // Store pointer in HashMap - no cache invalidation needed since
             // sample_ptr is heap-allocated and never moves
             try self.samples.put(owned_key, sample_ptr);
+
+            if (config.thread_local_cache and use_comptime_hash) {
+                self.updateCache(hash, sample_ptr);
+            }
+
+            return sample_ptr;
+        }
+
+        /// Fallback path for labels that don't fit in stack buffer
+        fn getOrCreateSampleAlloc(self: *Self, labels: TLabels, hash: u64) !*HistogramSample {
+            const allocated_key = try generateLabelKey(self.allocator, TLabels, labels);
+
+            // Check if sample already exists
+            if (self.samples.get(allocated_key)) |sample_ptr| {
+                self.allocator.free(allocated_key);
+                if (config.thread_local_cache and use_comptime_hash) {
+                    self.updateCache(hash, sample_ptr);
+                }
+                return sample_ptr;
+            }
+
+            // Cold path: allocate new sample on heap (pointer-stable)
+            const sample_ptr = try self.allocator.create(HistogramSample);
+            errdefer self.allocator.destroy(sample_ptr);
+            sample_ptr.* = try HistogramSample.init(self.allocator, self.buckets.upper_bounds.len);
+
+            // Store pointer in HashMap with the already-allocated key
+            try self.samples.put(allocated_key, sample_ptr);
 
             if (config.thread_local_cache and use_comptime_hash) {
                 self.updateCache(hash, sample_ptr);
