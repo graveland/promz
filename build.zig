@@ -25,6 +25,15 @@ pub fn createModule(
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", getVersion(b));
+
+    // Debug metrics: enabled by default only in Debug mode
+    const enable_debug_metrics = b.option(
+        bool,
+        "enable_debug_metrics",
+        "Enable debug metrics (default: true in Debug mode)",
+    ) orelse (optimize == .Debug);
+    options.addOption(bool, "enable_debug_metrics", enable_debug_metrics);
+
     mod.addOptions("build_options", options);
 
     return mod;
@@ -41,6 +50,15 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", getVersion(b));
+
+    // Debug metrics: enabled by default only in Debug mode
+    const enable_debug_metrics = b.option(
+        bool,
+        "enable_debug_metrics",
+        "Enable debug metrics (default: true in Debug mode)",
+    ) orelse (optimize == .Debug);
+    options.addOption(bool, "enable_debug_metrics", enable_debug_metrics);
+
     mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{

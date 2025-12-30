@@ -23,6 +23,13 @@ pub const BucketConfig = @import("core/histogram.zig").BucketConfig;
 pub const defaultBuckets = @import("core/histogram.zig").defaultBuckets;
 pub const DEFAULT_BUCKETS = @import("core/histogram.zig").DEFAULT_BUCKETS;
 
+// Debug metrics (zero-overhead when disabled in release builds)
+pub const debug = @import("core/debug.zig");
+pub const DebugCounter = debug.DebugCounter;
+pub const DebugGauge = debug.DebugGauge;
+pub const DebugHistogram = debug.DebugHistogram;
+pub const debug_metrics_enabled = debug.enabled;
+
 // Noop support for disabled metrics
 pub const RegistryOpts = @import("core/noop.zig").RegistryOpts;
 pub const initializeNoop = @import("core/noop.zig").initializeNoop;
