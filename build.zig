@@ -1,14 +1,5 @@
 const std = @import("std");
 
-fn getVersion(b: *std.Build) []const u8 {
-    const src_dir = std.fs.path.dirname(@src().file) orelse ".";
-    var exit_code: u8 = 0;
-    const git_hash = b.runAllowFail(&[_][]const u8{
-        "git", "-C", src_dir, "rev-parse", "HEAD",
-    }, &exit_code, .Inherit) catch return "unknown";
-    return std.mem.trim(u8, git_hash, &std.ascii.whitespace);
-}
-
 /// Creates the promz module with injected dependencies.
 /// Use this when incorporating promz as a dependency to share modules with parent.
 pub fn createModule(
@@ -24,7 +15,7 @@ pub fn createModule(
     });
 
     const options = b.addOptions();
-    options.addOption([]const u8, "version", getVersion(b));
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
 
     // Debug metrics: enabled by default only in Debug mode
     const enable_debug_metrics = b.option(
@@ -49,7 +40,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const options = b.addOptions();
-    options.addOption([]const u8, "version", getVersion(b));
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
 
     // Debug metrics: enabled by default only in Debug mode
     const enable_debug_metrics = b.option(
