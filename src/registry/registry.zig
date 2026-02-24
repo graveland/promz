@@ -42,26 +42,22 @@ pub const Registry = struct {
         try self.collectors.append(self.allocator, collector);
     }
 
-    /// Gather all metrics from all collectors and write in Prometheus format (thread-safe)
+    /// Gather all metrics from all collectors and write in Prometheus format.
+    /// Lock-free: all collectors must be registered before the first gather.
+    /// Individual metrics are thread-safe (atomic counters/gauges, per-sample mutex for histograms).
     pub fn gather(self: *Registry, writer: anytype) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         for (self.collectors.items) |collector| {
             try collector.collect(writer);
         }
     }
 
-    /// Gather metrics into a string (thread-safe)
+    /// Gather metrics into a string.
+    /// Lock-free: all collectors must be registered before the first gather.
+    /// Individual metrics are thread-safe (atomic counters/gauges, per-sample mutex for histograms).
     pub fn gatherToString(self: *Registry) ![]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Start with empty list and let it grow naturally
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(self.allocator);
 
-        // Create a simple wrapper that appends to the list
         const ListWriter = struct {
             list: *std.ArrayList(u8),
             allocator: std.mem.Allocator,
@@ -73,7 +69,6 @@ pub const Registry = struct {
 
         var writer = ListWriter{ .list = &list, .allocator = self.allocator };
 
-        // Collect from each collector
         for (self.collectors.items) |collector| {
             try collector.collect(&writer);
         }
