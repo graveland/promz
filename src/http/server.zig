@@ -47,7 +47,7 @@ pub const MetricsServer = struct {
     ///
     /// The registry must remain valid for the lifetime of the server.
     pub fn init(allocator: std.mem.Allocator, registry: *Registry) MetricsServer {
-        var threaded = std.Io.Threaded.init(allocator);
+        var threaded = std.Io.Threaded.init(allocator, .{});
         return .{
             .allocator = allocator,
             .registry = registry,

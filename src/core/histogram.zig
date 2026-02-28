@@ -92,11 +92,12 @@ fn HistogramSampleType(comptime V: type, comptime thread_safe: bool) type {
         sum: V, // Sum of all observed values
         count: u64, // Total number of observations
         allocator: std.mem.Allocator,
-        mutex: if (thread_safe) std.Thread.Mutex else void,
+        mutex: if (thread_safe) std.Io.Mutex else void,
+        io: if (thread_safe) std.Io else void,
 
         const Self = @This();
 
-        fn init(allocator: std.mem.Allocator, bucket_count: usize) !Self {
+        fn init(allocator: std.mem.Allocator, bucket_count: usize, io: if (thread_safe) std.Io else void) !Self {
             // +1 for the +Inf bucket
             const bucket_counts = try allocator.alloc(u64, bucket_count + 1);
             @memset(bucket_counts, 0);
@@ -106,7 +107,8 @@ fn HistogramSampleType(comptime V: type, comptime thread_safe: bool) type {
                 .sum = zero,
                 .count = 0,
                 .allocator = allocator,
-                .mutex = if (thread_safe) std.Thread.Mutex{} else {},
+                .mutex = if (thread_safe) .init else {},
+                .io = io,
             };
         }
 
@@ -116,8 +118,8 @@ fn HistogramSampleType(comptime V: type, comptime thread_safe: bool) type {
 
         fn reset(self: *Self) void {
             if (thread_safe) {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
             }
             @memset(self.bucket_counts, 0);
             self.sum = zero;
@@ -126,8 +128,8 @@ fn HistogramSampleType(comptime V: type, comptime thread_safe: bool) type {
 
         fn observe(self: *Self, value: V, upper_bounds: []const V) void {
             if (thread_safe) {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
             }
 
             self.sum += value;
@@ -177,14 +179,16 @@ pub fn Histogram(comptime V: type, comptime TLabels: type, comptime config: Hist
         noop: void,
         impl: Impl,
 
-        /// Initialize an active histogram with the given name, help text, and bucket configuration
+        /// Initialize an active histogram with the given name, help text, and bucket configuration.
+        /// When thread_safe is enabled, pass an std.Io for mutex operations; otherwise pass {}.
         pub fn init(
             allocator: std.mem.Allocator,
             name: []const u8,
             help: []const u8,
             buckets: BucketConfig(V),
+            io: if (config.thread_safe) std.Io else void,
         ) !Self {
-            return .{ .impl = try Impl.init(allocator, name, help, buckets) };
+            return .{ .impl = try Impl.init(allocator, name, help, buckets, io) };
         }
 
         /// Clean up resources
@@ -330,6 +334,7 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
         samples: if (use_single_sample) void else SampleMap,
         samples_array: if (use_single_sample) void else std.ArrayListUnmanaged(*HistogramSample),
         generation: u32,
+        io: if (config.thread_safe) std.Io else void,
 
         threadlocal var tl_cache: [CACHE_SIZE]?CacheEntry = .{null} ** CACHE_SIZE;
         threadlocal var tl_lru_tick: u8 = 0;
@@ -340,6 +345,7 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             name: []const u8,
             help: []const u8,
             buckets: BucketConfig(V),
+            io: if (config.thread_safe) std.Io else void,
         ) !Self {
             const info = MetricInfo{
                 .name = name,
@@ -353,10 +359,11 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
                     .allocator = allocator,
                     .info = info,
                     .buckets = buckets,
-                    .sample = try HistogramSample.init(allocator, buckets.upper_bounds.len),
+                    .sample = try HistogramSample.init(allocator, buckets.upper_bounds.len, io),
                     .samples = {},
                     .samples_array = {},
                     .generation = 0,
+                    .io = io,
                 };
             } else {
                 return Self{
@@ -367,6 +374,7 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
                     .samples = SampleMap.init(allocator),
                     .samples_array = .empty,
                     .generation = 0,
+                    .io = io,
                 };
             }
         }
@@ -587,7 +595,7 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             // Cold path: allocate new sample on heap (pointer-stable)
             const sample_ptr = try self.allocator.create(HistogramSample);
             errdefer self.allocator.destroy(sample_ptr);
-            sample_ptr.* = try HistogramSample.init(self.allocator, self.buckets.upper_bounds.len);
+            sample_ptr.* = try HistogramSample.init(self.allocator, self.buckets.upper_bounds.len, self.io);
 
             // Allocate key for storage in HashMap
             const owned_key = try generateLabelKey(self.allocator, TLabels, labels);
@@ -620,7 +628,7 @@ fn HistogramImpl(comptime V: type, comptime TLabels: type, comptime config: Hist
             // Cold path: allocate new sample on heap (pointer-stable)
             const sample_ptr = try self.allocator.create(HistogramSample);
             errdefer self.allocator.destroy(sample_ptr);
-            sample_ptr.* = try HistogramSample.init(self.allocator, self.buckets.upper_bounds.len);
+            sample_ptr.* = try HistogramSample.init(self.allocator, self.buckets.upper_bounds.len, self.io);
 
             // Store pointer in HashMap with the already-allocated key
             try self.samples.put(allocated_key, sample_ptr);
@@ -780,6 +788,7 @@ test "Histogram(f64, NoLabels): basic observation" {
         "test_histogram",
         "Test histogram",
         buckets,
+        {},
     );
     defer hist.deinit();
 
@@ -805,6 +814,7 @@ test "Histogram(f64, NoLabels): default buckets" {
         "latency_seconds",
         "Request latency in seconds",
         defaultBuckets(),
+        {},
     );
     defer hist.deinit();
 
@@ -830,6 +840,7 @@ test "Histogram(f64) with struct labels" {
         "http_request_duration_seconds",
         "HTTP request duration",
         buckets,
+        {},
     );
     defer hist.deinit();
 
@@ -851,6 +862,7 @@ test "Histogram(f64) with RuntimeLabels" {
         "response_size_bytes",
         "Response size in bytes",
         buckets,
+        {},
     );
     defer hist.deinit();
 
@@ -881,6 +893,7 @@ test "Histogram(u64, NoLabels): basic observation" {
         "response_bytes",
         "Response size in bytes",
         buckets,
+        {},
     );
     defer hist.deinit();
 
@@ -914,13 +927,20 @@ test "BucketConfig(u64): linear buckets" {
 // Thread-safe tests
 // ============================================================================
 
+fn testIo() std.Io {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    return threaded.io();
+}
+
 test "Histogram(f64, NoLabels, thread_safe): basic observation" {
+    const io = testIo();
     const buckets = BucketConfig(f64).custom(&[_]f64{ 1.0, 5.0, 10.0 });
     var hist = try Histogram(f64, NoLabels, .{ .thread_safe = true }).init(
         std.testing.allocator,
         "test_histogram",
         "Test histogram",
         buckets,
+        io,
     );
     defer hist.deinit();
 

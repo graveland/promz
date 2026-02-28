@@ -2,7 +2,7 @@
     .name = .promz,
     .version = "0.1.0",
     .fingerprint = 0xddce7e10a1021de0,
-    .minimum_zig_version = "0.16.0-dev.1634+b27bdd5af",
+    .minimum_zig_version = "0.16.0-dev.2676+4e2cec265",
     .dependencies = .{},
     .paths = .{
         "build.zig",

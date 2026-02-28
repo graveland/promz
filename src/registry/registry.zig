@@ -6,12 +6,14 @@ const Collector = @import("collector.zig").Collector;
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     collectors: std.ArrayList(Collector),
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) Registry {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Registry {
         return Registry{
             .allocator = allocator,
             .collectors = .empty,
+            .io = io,
         };
     }
 
@@ -23,8 +25,8 @@ pub const Registry = struct {
     /// If deinit_collectors is false, only the collector list is freed but
     /// collectors themselves are not deinitialized (caller manages lifecycle).
     pub fn deinitWithOptions(self: *Registry, deinit_collectors: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (deinit_collectors) {
             for (self.collectors.items) |collector| {
@@ -36,8 +38,8 @@ pub const Registry = struct {
 
     /// Register a collector with this registry (thread-safe)
     pub fn registerCollector(self: *Registry, collector: Collector) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         try self.collectors.append(self.allocator, collector);
     }
@@ -77,8 +79,14 @@ pub const Registry = struct {
     }
 };
 
+fn testIo() std.Io {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    return threaded.io();
+}
+
 test "Registry: init and deinit" {
-    var registry = Registry.init(std.testing.allocator);
+    const io = testIo();
+    var registry = Registry.init(std.testing.allocator, io);
     defer registry.deinit();
 
     try std.testing.expectEqual(0, registry.collectors.items.len);
@@ -89,7 +97,8 @@ test "Registry: gatherToString" {
     const NoLabels = @import("../core/labels.zig").NoLabels;
     const MetricCollector = @import("collector.zig").MetricCollector;
 
-    var registry = Registry.init(std.testing.allocator);
+    const io = testIo();
+    var registry = Registry.init(std.testing.allocator, io);
     defer registry.deinit();
 
     var collector = try MetricCollector.init(std.testing.allocator, "test");
@@ -119,7 +128,8 @@ test "Registry: gatherToString with labeled metrics" {
     const NoLabels = @import("../core/labels.zig").NoLabels;
     const MetricCollector = @import("collector.zig").MetricCollector;
 
-    var registry = Registry.init(std.testing.allocator);
+    const io = testIo();
+    var registry = Registry.init(std.testing.allocator, io);
     defer registry.deinit();
 
     var collector = try MetricCollector.init(std.testing.allocator, "app");
@@ -144,6 +154,7 @@ test "Registry: gatherToString with labeled metrics" {
         "http_request_duration_seconds",
         "HTTP request duration in seconds",
         defaultBuckets(),
+        io,
     );
     defer http_duration.deinit();
 

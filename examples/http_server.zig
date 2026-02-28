@@ -23,25 +23,26 @@ const DurationLabels = struct {
 
 const Metrics = struct {
     collector: promz.MetricCollector,
-    http_requests: promz.Counter(HttpLabels, .{ .thread_safe = true }),
-    http_duration: promz.Histogram(DurationLabels, .{ .thread_safe = true }),
-    active_connections: promz.Gauge(promz.NoLabels, .{ .thread_safe = true }),
+    http_requests: promz.Counter(f64, HttpLabels, .{ .thread_safe = true }),
+    http_duration: promz.Histogram(f64, DurationLabels, .{ .thread_safe = true }),
+    active_connections: promz.Gauge(f64, promz.NoLabels, .{ .thread_safe = true }),
 
-    fn init(allocator: std.mem.Allocator) !Metrics {
+    fn init(allocator: std.mem.Allocator, io: std.Io) !Metrics {
         return .{
             .collector = try promz.MetricCollector.init(allocator, "app"),
-            .http_requests = try promz.Counter(HttpLabels, .{ .thread_safe = true }).init(
+            .http_requests = try promz.Counter(f64, HttpLabels, .{ .thread_safe = true }).init(
                 allocator,
                 "http_requests_total",
                 "Total HTTP requests by method and status",
             ),
-            .http_duration = try promz.Histogram(DurationLabels, .{ .thread_safe = true }).init(
+            .http_duration = try promz.Histogram(f64, DurationLabels, .{ .thread_safe = true }).init(
                 allocator,
                 "http_request_duration_seconds",
                 "HTTP request duration in seconds",
-                promz.BucketConfig.default(),
+                promz.defaultBuckets(),
+                io,
             ),
-            .active_connections = try promz.Gauge(promz.NoLabels, .{ .thread_safe = true }).init(
+            .active_connections = try promz.Gauge(f64, promz.NoLabels, .{ .thread_safe = true }).init(
                 allocator,
                 "http_active_connections",
                 "Number of active HTTP connections",
@@ -49,7 +50,6 @@ const Metrics = struct {
         };
     }
 
-    // CRITICAL: Register metrics AFTER struct is in final location
     fn register(self: *Metrics) !void {
         try self.collector.registerMetric(&self.http_requests);
         try self.collector.registerMetric(&self.http_duration);
@@ -60,7 +60,6 @@ const Metrics = struct {
         self.active_connections.deinit();
         self.http_duration.deinit();
         self.http_requests.deinit();
-        // NOTE: Don't deinit collector - it's owned by the Registry
     }
 };
 
@@ -69,19 +68,18 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Create registry
-    var registry = promz.Registry.init(allocator);
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    const io = threaded.io();
+
+    var registry = promz.Registry.init(allocator, io);
     defer registry.deinit();
 
-    // Initialize metrics
-    var metrics = try Metrics.init(allocator);
+    var metrics = try Metrics.init(allocator, io);
     defer metrics.deinit();
 
-    // Register AFTER metrics struct is in final location
     try metrics.register();
     try registry.registerCollector(metrics.collector.collector());
 
-    // Add some sample data
     try metrics.http_requests.inc(.{ .method = "GET", .status = "200" });
     try metrics.http_requests.inc(.{ .method = "GET", .status = "200" });
     try metrics.http_requests.inc(.{ .method = "POST", .status = "201" });
@@ -93,8 +91,7 @@ pub fn main() !void {
 
     try metrics.active_connections.set(.{}, 5.0);
 
-    // Start the metrics server
-    var server = promz.MetricsServer.init(allocator, &registry);
+    var server = promz.MetricsServer.initWithIo(allocator, io, &registry);
     defer server.deinit();
 
     std.log.info("Press Ctrl+C to stop", .{});

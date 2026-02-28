@@ -36,7 +36,7 @@ pub fn DebugHistogram(comptime V: type, comptime TLabels: type, comptime config:
     if (enabled) {
         return histogram.Histogram(V, TLabels, config);
     } else {
-        return NoopHistogram(V, TLabels);
+        return NoopHistogram(V, TLabels, config);
     }
 }
 
@@ -141,7 +141,7 @@ fn NoopGauge(comptime V: type, comptime TLabels: type) type {
 }
 
 /// Zero-size no-op Histogram - all methods compile away completely.
-fn NoopHistogram(comptime V: type, comptime TLabels: type) type {
+fn NoopHistogram(comptime V: type, comptime TLabels: type, comptime config: histogram.HistogramConfig) type {
     const is_integer = @typeInfo(V) == .int;
     const zero: V = if (is_integer) 0 else 0.0;
 
@@ -149,7 +149,7 @@ fn NoopHistogram(comptime V: type, comptime TLabels: type) type {
         pub const Labels = TLabels;
         pub const ValueType = V;
 
-        pub fn init(_: std.mem.Allocator, _: []const u8, _: []const u8, _: histogram.BucketConfig(V)) !@This() {
+        pub fn init(_: std.mem.Allocator, _: []const u8, _: []const u8, _: histogram.BucketConfig(V), _: if (config.thread_safe) std.Io else void) !@This() {
             return .{};
         }
 
@@ -214,8 +214,8 @@ test "NoopGauge has zero size" {
 }
 
 test "NoopHistogram has zero size" {
-    try std.testing.expectEqual(0, @sizeOf(NoopHistogram(u64, NoLabels)));
-    try std.testing.expectEqual(0, @sizeOf(NoopHistogram(f64, NoLabels)));
+    try std.testing.expectEqual(0, @sizeOf(NoopHistogram(u64, NoLabels, .{})));
+    try std.testing.expectEqual(0, @sizeOf(NoopHistogram(f64, NoLabels, .{})));
 }
 
 test "NoopCounter: all operations work without error" {
@@ -260,7 +260,7 @@ test "NoopGauge: all operations work without error" {
 
 test "NoopHistogram: all operations work without error" {
     const buckets = histogram.BucketConfig(f64).custom(&[_]f64{ 1.0, 5.0, 10.0 });
-    var h = try NoopHistogram(f64, NoLabels).init(std.testing.allocator, "test", "help", buckets);
+    var h = try NoopHistogram(f64, NoLabels, .{}).init(std.testing.allocator, "test", "help", buckets, {});
     defer h.deinit();
 
     try h.observe(.{}, 2.5);
